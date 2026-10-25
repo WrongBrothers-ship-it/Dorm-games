@@ -1,0 +1,2529 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dorm Party!</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <style>
+    body { margin: 0; background: #000; color: #fff; font-family: 'Press Start 2P', monospace; }
+    #debug { padding: 8px 12px; font-size: 9px; color: #27d3ff; opacity: 0.85; }
+    #game { display: block; margin: 0 auto; width: min(100vw, calc((100vh - 40px) * 1.6)); background: #000; }
+  </style>
+</head>
+<body>
+  <div id="debug">Waiting for phones...</div>
+  <canvas id="game" width="800" height="500"></canvas>
+
+<script>
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}`);
+
+  const debugEl = document.getElementById('debug');
+  const display = document.getElementById('game');
+  const dctx = display.getContext('2d');
+
+  const MAX_PLAYERS = 6;
+
+  // The retro palette. Everything on screen is snapped to these colours.
+  const PALETTE_HEX = [
+    '#000000', '#0b0720', '#1a1040', '#2b1a63', '#4a2a8a', '#6b3fc0',
+    '#8a1c7c', '#c0289c', '#ff3fb4', '#ff8ad8',
+    '#12306b', '#1f5fc0', '#2f8fff', '#27d3ff', '#9ff3ff',
+    '#0b3d2e', '#1f7a3a', '#3fbf3f', '#8cff4a',
+    '#ffe83a', '#ffb000', '#ff6a1a', '#d93a1a', '#7a1018', '#ff3a3a',
+    '#ffffff', '#c8c8d8', '#8a8aa0', '#5c5c78', '#4a4a60', '#2a2a3c',
+    '#6b3a1a', '#b06a2a', '#e0a860', '#ffc08a',
+    '#101428', '#161a38', '#1e2448', '#2a3060', '#3a3f78', '#2a1f48', '#3a2a66', '#52407f', '#7a4a86',
+    '#1d6a78', '#2f93a3', '#2f9a45', '#6b6b88', '#a0a0b8', '#b8a050',
+    '#e8575a', '#4fc3e0', '#7fd45a', '#f0d050', '#e050b0', '#e8a030', '#7a5ad0',
+  ];
+  const CYAN = '#4fc3e0';
+  const MAGENTA = '#e050b0';
+  const YELLOW = '#f0d050';
+  const GREEN = '#7fd45a';
+  const RED = '#e8575a';
+  const ORANGE = '#e8a030';
+  const VIOLET = '#7a5ad0';
+  const COLORS = [RED, CYAN, GREEN, YELLOW, ORANGE, MAGENTA];
+
+  // ---------------------------------------------------------------- players
+
+  // phoneId -> { slot, pc, channel, connId, remoteSet, pendingCandidates,
+  //              input, ready, active, score }
+  const players = {};
+  // Each offer gets a new id. Signaling messages carry it so stale ones can be dropped.
+  let lastConnId = 0;
+
+  function updateDebug(text) {
+    const count = Object.keys(players).length;
+    debugEl.textContent = `Players: ${count}/${MAX_PLAYERS}${text ? ' | ' + text : ''}`;
+  }
+
+  function freeSlot() {
+    const used = new Set(Object.values(players).map((p) => p.slot));
+    for (let i = 0; i < MAX_PLAYERS; i++) if (!used.has(i)) return i;
+    return -1;
+  }
+
+  function sendTo(p, obj) {
+    if (p.channel && p.channel.readyState === 'open') p.channel.send(JSON.stringify(obj));
+  }
+
+  function removePlayer(phoneId) {
+    const p = players[phoneId];
+    if (!p) return;
+    delete players[phoneId];
+    p.pc.close();
+    updateDebug(`Player ${p.slot + 1} left`);
+  }
+
+  // Players taking part in the current party (late joiners wait in the lobby)
+  const active = () => Object.values(players).filter((p) => p.active);
+
+  // ------------------------------------------------------------ shared bits
+
+  const W = 800, H = 500, CX = 400, CY = 250;
+  const LAP = Math.PI * 2;
+  const ordinal = (n) => ['1st', '2nd', '3rd', '4th'][n - 1] || `${n}th`;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const snap = (v) => Math.round(v / 2) * 2;
+  const seeded = (seed) => {
+    let s = seed;
+    return () => {
+      s = (s * 16807) % 2147483647;
+      return s / 2147483647;
+    };
+  };
+  const makeCanvas = (w, h) => {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    return c;
+  };
+  const hexToRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  const mix = (a, b, t) => {
+    const [r1, g1, b1] = hexToRgb(a), [r2, g2, b2] = hexToRgb(b);
+    return `rgb(${Math.round(r1 + (r2 - r1) * t)},${Math.round(g1 + (g2 - g1) * t)},${Math.round(b1 + (b2 - b1) * t)})`;
+  };
+
+  // ------------------------------------------------- the 8-bit render pipeline
+  // Scenes are drawn at full size on `scene`, shrunk to a chunky grid, snapped to
+  // the palette with ordered dithering, then blown back up with hard pixel edges.
+  // Text goes on its own layer so it stays crisp.
+
+  const scene = makeCanvas(W, H);
+  const ctx = scene.getContext('2d');
+  const textLayer = makeCanvas(W, H);
+  const tctx = textLayer.getContext('2d');
+  const LOW_W = 400, LOW_H = 250;
+  const low = makeCanvas(LOW_W, LOW_H);
+  const lctx = low.getContext('2d', { willReadFrequently: true });
+
+  const PAL = PALETTE_HEX.map(hexToRgb);
+  const lut = new Uint8Array(32 * 32 * 32).fill(255);
+  const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+  const DITHER = 1.1;
+
+  function nearestColor(r, g, b) {
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    if (lut[key] !== 255) return lut[key];
+    const cr = (r & 0xf8) + 4, cg = (g & 0xf8) + 4, cb = (b & 0xf8) + 4;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < PAL.length; i++) {
+      const d = (PAL[i][0] - cr) ** 2 + (PAL[i][1] - cg) ** 2 + (PAL[i][2] - cb) ** 2;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    lut[key] = best;
+    return best;
+  }
+
+  function quantize(data) {
+    for (let p = 0, i = 0; p < LOW_W * LOW_H; p++, i += 4) {
+      const x = p % LOW_W, y = (p / LOW_W) | 0;
+      const d = (BAYER[(y & 3) * 4 + (x & 3)] - 7.5) * DITHER;
+      const c = PAL[nearestColor(clamp(data[i] + d, 0, 255), clamp(data[i + 1] + d, 0, 255), clamp(data[i + 2] + d, 0, 255))];
+      data[i] = c[0];
+      data[i + 1] = c[1];
+      data[i + 2] = c[2];
+      data[i + 3] = 255;
+    }
+  }
+
+  // Faint scanlines, one per big pixel row
+  const scanlines = makeCanvas(W, H);
+  (function buildScanlines() {
+    const g = scanlines.getContext('2d');
+    g.fillStyle = 'rgba(0,0,0,0.10)';
+    for (let y = 1; y < H; y += 2) g.fillRect(0, y, W, 1);
+  })();
+
+  function present() {
+    lctx.imageSmoothingEnabled = true;
+    lctx.imageSmoothingQuality = 'high';
+    lctx.drawImage(scene, 0, 0, LOW_W, LOW_H);
+    const img = lctx.getImageData(0, 0, LOW_W, LOW_H);
+    quantize(img.data);
+    lctx.putImageData(img, 0, 0);
+    dctx.imageSmoothingEnabled = false;
+    dctx.drawImage(low, 0, 0, W, H);
+    dctx.drawImage(textLayer, 0, 0);
+    dctx.drawImage(scanlines, 0, 0);
+  }
+
+  // ----------------------------------------------------------- text + panels
+
+  const PF = "'Press Start 2P', 'Courier New', monospace";
+  const fontPx = (size) => Math.max(8, Math.round((size * 0.8) / 2) * 2);
+
+  // Pixel-font text with a hard drop shadow. Shrinks to fit the screen edge.
+  function bigText(text, y, size, color = '#fff', align = 'center', x = CX) {
+    let fs = fontPx(size);
+    tctx.font = `${fs}px ${PF}`;
+    const room = align === 'center' ? 2 * Math.min(x, W - x) - 8 : align === 'left' ? W - x - 4 : x - 4;
+    const w = tctx.measureText(text).width;
+    if (w > room) {
+      fs = Math.max(8, Math.floor((fs * room) / w));
+      tctx.font = `${fs}px ${PF}`;
+    }
+    tctx.textAlign = align;
+    const o = Math.max(1, Math.round(fs / 10));
+    tctx.fillStyle = '#000';
+    tctx.fillText(text, x + o, y + o);
+    tctx.shadowColor = color;
+    tctx.shadowBlur = fs >= 14 ? fs * 0.7 : 6;
+    tctx.fillStyle = color;
+    tctx.fillText(text, x, y);
+    tctx.shadowBlur = 0;
+  }
+
+  // Wraps long copy so it never runs off the screen
+  function wrapText(text, y, size, color, maxW, x = CX) {
+    const fs = fontPx(size);
+    tctx.font = `${fs}px ${PF}`;
+    const words = text.split(' ');
+    const lines = [];
+    let line = '';
+    for (const w of words) {
+      const test = line ? `${line} ${w}` : w;
+      if (tctx.measureText(test).width > maxW && line) {
+        lines.push(line);
+        line = w;
+      } else {
+        line = test;
+      }
+    }
+    lines.push(line);
+    lines.forEach((l, i) => bigText(l, y + i * (fs + 6), size, color, 'center', x));
+    return lines.length;
+  }
+
+  // Shrinks a design size until the text fits the given width
+  function fitSize(text, size, maxW) {
+    tctx.font = `${fontPx(size)}px ${PF}`;
+    const w = tctx.measureText(text).width;
+    return w > maxW ? (size * maxW) / w : size;
+  }
+
+  // Arcade logo: bright letters on a stack of magenta/purple extrusion
+  function titleText(text, y, size, now, maxW = 740) {
+    size = fitSize(text, size, maxW);
+    const fs = fontPx(size);
+    tctx.font = `${fs}px ${PF}`;
+    tctx.textAlign = 'center';
+    const o = Math.max(2, Math.round(fs / 10));
+    for (let k = 4; k >= 1; k--) {
+      tctx.fillStyle = k > 2 ? '#2b1a63' : '#c0289c';
+      tctx.fillText(text, CX + o * k, y + o * k);
+    }
+    tctx.fillStyle = Math.floor(now / 700) % 6 === 0 ? '#ffffff' : YELLOW;
+    tctx.fillText(text, CX, y);
+  }
+
+  // Hard-edged arcade panel with a thick border
+  function panel(x, y, w, h, color, fill = 'rgba(11,7,32,0.9)') {
+    x = snap(x); y = snap(y); w = snap(w); h = snap(h);
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, h);
+    ctx.save();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, w, 4);
+    ctx.fillRect(x, y + h - 4, w, 4);
+    ctx.fillRect(x, y, 4, h);
+    ctx.fillRect(x + w - 4, y, 4, h);
+    ctx.restore();
+  }
+
+  function shade(alpha) {
+    ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Tiny pixel-art sprites, drawn from character maps
+  function drawSprite(map, colors, x, y, px, alpha = 1) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    map.forEach((row, ry) => {
+      for (let rx = 0; rx < row.length; rx++) {
+        const c = colors[row[rx]];
+        if (!c) continue;
+        ctx.fillStyle = c;
+        ctx.fillRect(x + rx * px, y + ry * px, px, px);
+      }
+    });
+    ctx.restore();
+  }
+
+  const PERSON = [
+    '..hhhh..',
+    '.hhhhhh.',
+    '.ssssss.',
+    '.sesses.',
+    '..cccc..',
+    '.cccccc.',
+    'sccccccs',
+    's.cccc.s',
+    '..cccc..',
+    '..bbbb..',
+    '..b..b..',
+    '.kk..kk.',
+  ];
+  const personColors = (shirt) => ({ h: '#6b3a1a', s: '#ffc08a', e: '#0b0720', c: shirt, b: '#1f5fc0', k: '#ffffff' });
+
+  // Feet centred on (x, y); about 12 * px tall
+  function drawPerson(x, y, px, shirt, alpha = 1) {
+    drawSprite(PERSON, personColors(shirt), x - 4 * px, y - 12 * px, px, alpha);
+  }
+
+  const ICONS = {
+    race: { colors: { r: RED, w: '#9ff3ff', k: '#c8c8d8' }, map: [
+      '...rrrr...', '..rrwwrr..', '.rrrrrrrr.', 'rrrrrrrrrr', 'rrrrrrrrrr', '.kk....kk.', '.kk....kk.'] },
+    tug: { colors: { r: RED, y: '#e0a860', h: '#ffc08a' }, map: [
+      '....r.....', '....rr....', '....rrr...', '....r.....', 'yyyyyyyyyy', 'h........h', 'h........h', 'h........h'] },
+    arena: { colors: { c: CYAN, w: '#ffffff', d: '#1f5fc0' }, map: [
+      '...cccc...', '..cwwccc..', '.cwwcccc..', 'cwcccccccc', 'ccccccccdd', 'ccccccdddd', '.ccccddddd', '..ccdddd..', '...dddd...'] },
+    fruit: { colors: { r: '#e8575a', g: '#7fd45a', w: '#ff8ad8' }, map: [
+      '...gg...', '..rrrr..', '.rwrrrr.', '.rrrrrr.', '.rrrrrr.', '.rrrrrr.', '..rrrr..', '...rr...'] },
+    plane: { colors: { w: '#ffffff', c: '#8a8aa0' }, map: [
+      'ww......', 'wwwww...', 'ccwwwwww', 'wwwww...', 'ww......'] },
+    potato: { colors: { k: '#8a8aa0', w: '#ffffff', o: '#ffb000' }, map: [
+      '.......o..', '......o.o.', '.....kk...', '...kkkkkk.', '..kkkkkkkk', '.kkwkkkkkk', '.kwwkkkkkk', '.kkkkkkkkk', '..kkkkkkk.', '...kkkkk..'] },
+    simon: { colors: { y: YELLOW }, map: [
+      '..yyyyyy..', '.yy....yy.', '.......yy.', '.....yyy..', '....yy....', '....yy....', '..........', '....yy....', '....yy....'] },
+    party: { colors: { y: YELLOW, o: ORANGE }, map: [
+      '....yy....', '....yy....', 'yyyyyyyyyy', '.yyyyyyyy.', '..yyyyyy..', '..yyyyyy..', '.yyy..yyy.', '.yy....yy.', 'oo......oo'] },
+  };
+
+  function drawIcon(id, cx, y, px) {
+    const icon = ICONS[id];
+    drawSprite(icon.map, icon.colors, cx - (icon.map[0].length / 2) * px, y, px);
+  }
+
+  // ------------------------------------------------ the arcade hall backdrop
+  // A corridor of neon cabinets over a checkered floor, painted once.
+
+  const hallBg = makeCanvas(W, H);
+  (function buildHall() {
+    const g = hallBg.getContext('2d');
+    const rand = seeded(21);
+    const HZ = 215, GH = H - HZ, ZEND = 5;
+    const sc = (z) => 1 / (1 + z);
+    const se = sc(ZEND);
+    const NEAR = 1.3;
+
+    const ceil = g.createLinearGradient(0, 0, 0, HZ);
+    ceil.addColorStop(0, '#0b0720');
+    ceil.addColorStop(1, '#2b1a63');
+    g.fillStyle = ceil;
+    g.fillRect(0, 0, W, H);
+
+    // Ceiling light strips running toward the far wall
+    const groundE = HZ + GH * se, topE = groundE - 475 * se;
+    g.lineWidth = 5;
+    [-3, -2, -1, 0, 1, 2, 3].forEach((k, i) => {
+      g.strokeStyle = i % 2 ? CYAN : MAGENTA;
+      g.beginPath();
+      g.moveTo(CX + k * 7, topE - 4);
+      g.lineTo(CX + k * 150, -10);
+      g.stroke();
+    });
+
+    // End wall with a window onto a planet
+    const ex0 = CX - 330 * se, ex1 = CX + 330 * se;
+    g.fillStyle = '#1a1040';
+    g.fillRect(ex0, topE, ex1 - ex0, groundE - topE);
+    g.fillStyle = '#0b0720';
+    g.fillRect(CX - 30, topE + 10, 60, 36);
+    for (let i = 0; i < 14; i++) {
+      g.fillStyle = '#fff';
+      g.fillRect(CX - 28 + rand() * 56, topE + 12 + rand() * 32, 2, 2);
+    }
+    g.fillStyle = MAGENTA;
+    g.beginPath();
+    g.arc(CX + 6, topE + 30, 11, 0, LAP);
+    g.fill();
+    g.strokeStyle = CYAN;
+    g.lineWidth = 3;
+    g.beginPath();
+    g.ellipse(CX + 6, topE + 30, 19, 5, -0.35, 0, LAP);
+    g.stroke();
+    g.strokeStyle = CYAN;
+    g.lineWidth = 4;
+    g.strokeRect(CX - 30, topE + 10, 60, 36);
+
+    // Side walls
+    g.fillStyle = '#1a1040';
+    for (const side of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(CX + side * 330 * se, groundE);
+      g.lineTo(CX + side * 330 * se, topE);
+      g.lineTo(CX + side * 330 * NEAR, HZ + GH * NEAR - 475 * NEAR);
+      g.lineTo(CX + side * 330 * NEAR, HZ + GH * NEAR);
+      g.closePath();
+      g.fill();
+    }
+
+    // Checkered floor, blue up close fading to magenta in the distance
+    const rows = 12, cols = 8, z0 = -0.23, dz = (ZEND - z0) / rows;
+    for (let k = 0; k < rows; k++) {
+      const sa = sc(z0 + k * dz), sb = sc(z0 + (k + 1) * dz);
+      const ya = HZ + GH * sa, yb = HZ + GH * sb;
+      const far = k / (rows - 1);
+      const cA = mix('#2f5fc0', '#c0289c', far), cB = mix('#4a2a8a', '#ff3fb4', far);
+      for (let j = 0; j < cols; j++) {
+        g.fillStyle = (j + k) % 2 ? cA : cB;
+        const xa0 = CX - 330 * sa + (j * 660 * sa) / cols, xa1 = CX - 330 * sa + ((j + 1) * 660 * sa) / cols;
+        const xb0 = CX - 330 * sb + (j * 660 * sb) / cols, xb1 = CX - 330 * sb + ((j + 1) * 660 * sb) / cols;
+        g.beginPath();
+        g.moveTo(xa0, ya);
+        g.lineTo(xa1, ya);
+        g.lineTo(xb1, yb);
+        g.lineTo(xb0, yb);
+        g.closePath();
+        g.fill();
+      }
+    }
+
+    // Neon strips where the floor meets the cabinets
+    g.lineWidth = 6;
+    g.strokeStyle = CYAN;
+    for (const side of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(CX + side * 330 * se, groundE);
+      g.lineTo(CX + side * 330 * NEAR, HZ + GH * NEAR);
+      g.stroke();
+    }
+
+    // Cabinets, far to near so near ones overlap
+    const accents = [MAGENTA, CYAN, YELLOW, GREEN, '#ff6a1a'];
+    const screens = [CYAN, MAGENTA, YELLOW, GREEN, '#0b0720'];
+    const spans = [[3.55, 4.8], [2.45, 3.4], [1.5, 2.3], [0.7, 1.35], [-0.2, 0.55]];
+    spans.forEach(([za, zb], si) => {
+      for (const side of [-1, 1]) {
+        const s0 = sc(za), s1 = sc(zb);
+        const x0 = CX + side * 330 * s0, x1 = CX + side * 330 * s1;
+        const gy0 = HZ + GH * s0, gy1 = HZ + GH * s1;
+        const h0 = 300 * s0, h1 = 300 * s1;
+        const P = (t, f) => [x0 + (x1 - x0) * t, gy0 + (gy1 - gy0) * t - (h0 + (h1 - h0) * t) * f];
+        const quad = (t0, t1, f0, f1, color) => {
+          g.fillStyle = color;
+          g.beginPath();
+          [P(t0, f0), P(t1, f0), P(t1, f1), P(t0, f1)].forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+          g.closePath();
+          g.fill();
+        };
+        const accent = accents[(si * 2 + (side > 0 ? 1 : 0)) % accents.length];
+        quad(0, 1, 0, 1, '#2a2a3c');
+        quad(0, 1, 0.86, 1, accent);
+        quad(0.08, 0.92, 0.5, 0.82, '#0b0720');
+        for (let a = 0; a < 3; a++) {
+          for (let b = 0; b < 2; b++) {
+            quad(0.12 + a * 0.26, 0.12 + a * 0.26 + 0.22, 0.54 + b * 0.13, 0.54 + b * 0.13 + 0.11,
+              screens[Math.floor(rand() * screens.length)]);
+          }
+        }
+        quad(0, 1, 0.38, 0.48, '#8a8aa0');
+        [0.25, 0.5, 0.75].forEach((t, i) => quad(t - 0.05, t + 0.05, 0.41, 0.45, [RED, YELLOW, CYAN][i]));
+        quad(0, 1, 0, 0.12, '#0b0720');
+      }
+    });
+  })();
+
+  function drawArcade(now) {
+    ctx.save();
+    ctx.filter = 'saturate(0.3) brightness(0.72)';
+    ctx.drawImage(hallBg, 0, 0);
+    ctx.restore();
+    // Marquee bulbs chasing along the ceiling line
+    for (let i = 0; i < 20; i++) {
+      ctx.fillStyle = (i + Math.floor(now / 250)) % 3 === 0 ? '#b8a050' : '#2a3060';
+      ctx.fillRect(8 + i * 40, 4, 8, 8);
+    }
+  }
+
+  // ------------------------------------------------------------ party state
+
+  const POINTS = [6, 5, 4, 3, 2, 1];
+  const PARTY_ROUNDS = 5;
+  const INTRO_SECONDS = 5;
+  const COUNTDOWN_SECONDS = 3;
+  const ROUND_END_SECONDS = 9;
+
+  // lobby <-> menu, then: intro -> countdown -> play -> roundEnd -> (next game | final | back to menu)
+  let phase = 'lobby';
+  let phaseStart = performance.now();
+  let playStart = 0;
+  let order = [];      // game ids for this party (a single id when picked from the menu)
+  let single = false;  // true when one game was picked from the menu
+  let round = 0;
+  let game = null;
+  let roundResults = [];
+  let mouse = { x: -1, y: -1 };
+  let toast = { text: '', until: 0 };
+
+  function phaseMessage(p) {
+    if (phase === 'lobby') return p.ready ? 'READY! Waiting for the others...' : 'Tap READY when you are set';
+    if (phase === 'menu') return 'Pick a game on the TV';
+    if (!p.active) return 'Game in progress, you join the next one';
+    if (phase === 'intro') return game.controls;
+    if (phase === 'countdown') return 'Get ready...';
+    if (phase === 'play') return game.phoneText(p);
+    if (phase === 'roundEnd') return 'Round over!';
+    return 'Game over!';
+  }
+
+  function buttonLabel() {
+    if (phase === 'lobby') return 'READY';
+    if (phase === 'menu' || !game) return 'WAIT';
+    return game.button;
+  }
+
+  function sendPhase(p) {
+    sendTo(p, { type: 'phase', phase, text: phaseMessage(p), button: buttonLabel() });
+  }
+
+  function sendPhaseToAll() {
+    Object.values(players).forEach(sendPhase);
+  }
+
+  function setPhase(next) {
+    phase = next;
+    phaseStart = performance.now();
+    sendPhaseToAll();
+  }
+
+  const shuffle = (list) => {
+    const a = list.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  function startParty() {
+    const joined = Object.values(players);
+    if (joined.length === 0) return;
+    joined.forEach((p) => { p.active = true; p.ready = false; p.score = 0; });
+    order = shuffle(Object.keys(GAMES)).slice(0, PARTY_ROUNDS);
+    single = false;
+    round = 0;
+    beginIntro();
+  }
+
+  // Menu pick: play just one game with whoever is connected
+  function startSingle(id) {
+    const joined = Object.values(players);
+    if (joined.length === 0) {
+      toast = { text: 'INSERT A PLAYER FIRST', until: performance.now() + 2500 };
+      return;
+    }
+    joined.forEach((p) => { p.active = true; p.ready = false; p.score = 0; });
+    order = [id];
+    single = true;
+    round = 0;
+    beginIntro();
+  }
+
+  function toMenu() {
+    Object.values(players).forEach((p) => { p.active = false; p.ready = false; });
+    game = null;
+    setPhase('menu');
+  }
+
+  function beginIntro() {
+    game = GAMES[order[round]];
+    setPhase('intro');
+  }
+
+  function goCountdown() {
+    game.prepare(active());
+    setPhase('countdown');
+  }
+
+  function goPlay() {
+    if (game.begin) game.begin(active());
+    playStart = performance.now();
+    setPhase('play');
+  }
+
+  function endRound() {
+    const ranking = game.ranking();
+    roundResults = ranking.map((r, i) => {
+      const points = POINTS[i] || 0;
+      r.p.score += points;
+      return { p: r.p, slot: r.p.slot, label: r.label, points };
+    });
+    setPhase('roundEnd');
+  }
+
+  function nextRound() {
+    round += 1;
+    if (round < order.length) beginIntro();
+    else if (single) toMenu();
+    else setPhase('final');
+  }
+
+  function toLobby() {
+    Object.values(players).forEach((p) => { p.active = false; p.ready = false; });
+    game = null;
+    setPhase('lobby');
+  }
+
+  function update(now, dt) {
+    if (phase !== 'lobby' && phase !== 'menu' && active().length === 0) {
+      toLobby();
+      return;
+    }
+    const elapsed = (now - phaseStart) / 1000;
+
+    if (phase === 'lobby') {
+      const all = Object.values(players);
+      if (all.length > 0 && all.every((p) => p.ready)) startParty();
+    } else if (phase === 'intro') {
+      if (elapsed >= INTRO_SECONDS) goCountdown();
+    } else if (phase === 'countdown') {
+      if (elapsed >= COUNTDOWN_SECONDS) goPlay();
+    } else if (phase === 'play') {
+      if (game.update(now, dt, (now - playStart) / 1000)) endRound();
+    } else if (phase === 'roundEnd') {
+      if (elapsed >= ROUND_END_SECONDS) nextRound();
+    }
+  }
+
+  // Enter / click moves things along
+  function advance() {
+    if (phase === 'lobby') startParty();
+    else if (phase === 'intro') goCountdown();
+    else if (phase === 'roundEnd') nextRound();
+    else if (phase === 'final') toLobby();
+  }
+
+  // ========================================================= GAME 1: GRAND PRIX
+  // A road race with striped grass, red/white curbs, trees and a speed HUD.
+
+  // The circuit is a closed centreline (a smoothed loop through the points below).
+  // Road, curbs, lap progress and the off-road check are all measured against it.
+  const ROAD_HALF = 36;
+  const MAX_SPEED = 170;
+  const GRASS_SPEED = 60;
+  const RACE_GRACE_MS = 20000;
+  const RACE_TIME_LIMIT = 75;
+
+  const TRACK_CTRL = [
+    [650, 440], [450, 445], [250, 445], [120, 415], [70, 330], [130, 255], [250, 265],
+    [320, 335], [410, 340], [480, 280], [400, 215], [260, 150], [140, 95], [300, 60],
+    [500, 70], [600, 140], [560, 230], [660, 270], [740, 340], [735, 415],
+  ];
+
+  // Catmull-Rom through the control points, sampled about every 5px
+  const TRACK = (function () {
+    const n = TRACK_CTRL.length;
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const p0 = TRACK_CTRL[(i + n - 1) % n], p1 = TRACK_CTRL[i];
+      const p2 = TRACK_CTRL[(i + 1) % n], p3 = TRACK_CTRL[(i + 2) % n];
+      const steps = Math.max(4, Math.round(Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / 5));
+      for (let s = 0; s < steps; s++) {
+        const t = s / steps, t2 = t * t, t3 = t2 * t;
+        const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+        pts.push({ x: f(p0[0], p1[0], p2[0], p3[0]), y: f(p0[1], p1[1], p2[1], p3[1]) });
+      }
+    }
+    return pts;
+  })();
+  const TN = TRACK.length;
+
+  // Index of the sample on the start/finish line (where the bottom straight crosses the middle)
+  const START_IDX = TRACK.reduce((best, q, i) => (Math.abs(q.x - CX) + Math.abs(q.y - 445) < Math.abs(TRACK[best].x - CX) + Math.abs(TRACK[best].y - 445) ? i : best), 0);
+
+  // Nearest centreline sample, searching near the previous answer so a car can't hop to a far stretch
+  function nearestTrack(x, y, near) {
+    let bestI = near, bestD = Infinity;
+    const lo = near === undefined ? 0 : -14, hi = near === undefined ? TN - 1 : 14;
+    for (let k = lo; k <= hi; k++) {
+      const i = near === undefined ? k : (near + k + TN) % TN;
+      const d = (TRACK[i].x - x) ** 2 + (TRACK[i].y - y) ** 2;
+      if (d < bestD) { bestD = d; bestI = i; }
+    }
+    return { idx: bestI, dist: Math.sqrt(bestD) };
+  }
+
+  const wrapAngle = (a) => {
+    while (a > Math.PI) a -= LAP;
+    while (a < -Math.PI) a += LAP;
+    return a;
+  };
+
+  function resetCar(p) {
+    // Two columns on the start straight, heading left, staggered behind the line
+    const x = 452 + Math.floor(p.slot / 2) * 40;
+    const y = 445 + (p.slot % 2 ? 15 : -15);
+    const nt = nearestTrack(x, y);
+    let di = nt.idx - START_IDX;
+    if (di > TN / 2) di -= TN;
+    if (di < -TN / 2) di += TN;
+    p.car = {
+      x, y, heading: Math.PI, v: 0,
+      idx: nt.idx,
+      // 0..LAP around the circuit; negative just behind the line
+      progress: (di / TN) * LAP,
+      finished: false, finishTime: null, place: null,
+    };
+  }
+
+  function stepCar(p, dt) {
+    const c = p.car;
+    const gas = p.input.gas && !c.finished;
+    const maxV = nearestTrack(c.x, c.y, c.idx).dist <= ROAD_HALF ? MAX_SPEED : GRASS_SPEED;
+
+    c.v += (gas ? 150 : -90) * dt;
+    if (c.v > maxV) c.v = Math.max(maxV, c.v - 300 * dt);
+    c.v = Math.max(0, c.v);
+
+    // Cars barely turn when crawling, so you can't spin on the spot
+    c.heading += p.input.steer * 2.6 * Math.min(1, c.v / 60) * dt;
+    c.x = clamp(c.x + Math.cos(c.heading) * c.v * dt, 0, W);
+    c.y = clamp(c.y + Math.sin(c.heading) * c.v * dt, 0, H);
+
+    // Lap progress is how far the nearest centreline sample has moved along the loop
+    const nt = nearestTrack(c.x, c.y, c.idx);
+    let di = nt.idx - c.idx;
+    if (di > TN / 2) di -= TN;
+    if (di < -TN / 2) di += TN;
+    c.progress += (di / TN) * LAP;
+    c.idx = nt.idx;
+  }
+
+  // The circuit never changes, so it is painted once and stamped every frame
+  const trackCanvas = makeCanvas(W, H);
+
+  (function buildTrack() {
+    const g = trackCanvas.getContext('2d');
+    const rand = seeded(9);
+    const wedge = (r, a0, a1) => {
+      g.beginPath();
+      g.moveTo(CX, CY);
+      g.arc(CX, CY, r, a0, a1);
+      g.closePath();
+    };
+    const loop = (from, to) => {
+      g.beginPath();
+      for (let i = from; i <= to; i++) {
+        const q = TRACK[i % TN];
+        if (i === from) g.moveTo(q.x, q.y);
+        else g.lineTo(q.x, q.y);
+      }
+    };
+
+    // Grass in alternating bands, the way the old arcade racers drew it
+    for (let k = 0; k < 36; k++) {
+      g.fillStyle = k % 2 ? '#1f7a3a' : '#2f9a45';
+      wedge(700, (k / 36) * LAP, ((k + 1) / 36) * LAP);
+      g.fill();
+    }
+
+    g.lineJoin = 'round';
+    g.lineCap = 'butt';
+
+    // Red and white curbs: a wider dashed stroke under the road
+    g.lineWidth = ROAD_HALF * 2 + 12;
+    g.setLineDash([24, 24]);
+    g.strokeStyle = RED;
+    loop(0, TN);
+    g.stroke();
+    g.lineDashOffset = 24;
+    g.strokeStyle = '#ffffff';
+    loop(0, TN);
+    g.stroke();
+    g.setLineDash([]);
+    g.lineDashOffset = 0;
+
+    // Road, with matching light/dark bands
+    g.lineWidth = ROAD_HALF * 2;
+    const band = 10;
+    for (let i = 0; i < TN; i += band) {
+      g.strokeStyle = (i / band) % 2 ? '#4a4a60' : '#5c5c78';
+      loop(i, Math.min(i + band, TN));
+      g.stroke();
+    }
+    g.strokeStyle = '#5c5c78';
+    g.lineWidth = ROAD_HALF * 2;
+    g.lineCap = 'round';
+    g.lineCap = 'butt';
+
+    // Dashed centre line
+    g.fillStyle = '#ffffff';
+    for (let i = 0; i < TN; i += 7) g.fillRect(TRACK[i].x - 2, TRACK[i].y - 2, 4, 4);
+
+    // Start grid and checkered finish line, across the road at the start sample
+    const s = TRACK[START_IDX], s2 = TRACK[(START_IDX + 1) % TN];
+    const ang = Math.atan2(s2.y - s.y, s2.x - s.x);
+    g.save();
+    g.translate(s.x, s.y);
+    g.rotate(ang);
+    const cell = 8;
+    for (let row = 0; row < 3; row++) {
+      for (let y = -ROAD_HALF, col = 0; y < ROAD_HALF; y += cell, col++) {
+        g.fillStyle = (row + col) % 2 ? '#ffffff' : '#000000';
+        g.fillRect(-12 + row * cell, y, cell, Math.min(cell, ROAD_HALF - y));
+      }
+    }
+    g.restore();
+    g.strokeStyle = 'rgba(255,255,255,0.8)';
+    g.lineWidth = 3;
+    for (let sl = 0; sl < MAX_PLAYERS; sl++) {
+      g.strokeRect(452 + Math.floor(sl / 2) * 40 - 15, 445 + (sl % 2 ? 15 : -15) - 8, 30, 16);
+    }
+
+    // Palm-style trees scattered off the road
+    const tree = (x, y) => {
+      g.fillStyle = '#6b3a1a';
+      g.fillRect(x - 2, y - 2, 4, 12);
+      g.fillStyle = '#0b3d2e';
+      g.fillRect(x - 12, y - 14, 24, 8);
+      g.fillRect(x - 8, y - 20, 16, 8);
+      g.fillStyle = '#1f7a3a';
+      g.fillRect(x - 8, y - 14, 16, 4);
+    };
+    const spots = [];
+    for (let tries = 0; tries < 900 && spots.length < 46; tries++) {
+      const x = 16 + rand() * (W - 32), y = 24 + rand() * (H - 36);
+      if (nearestTrack(x, y).dist < ROAD_HALF + 26) continue;
+      if (spots.some((q) => Math.hypot(q[0] - x, q[1] - y) < 34)) continue;
+      spots.push([x, y]);
+    }
+    spots.sort((a, b) => a[1] - b[1]).forEach(([x, y]) => tree(x, y));
+  })();
+
+  // Top-down racing car: nose points along +x
+  function drawCar(p) {
+    const c = p.car;
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.heading);
+    ctx.scale(1.3, 1.3);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(-13, -5, 30, 16);
+
+    if (p.input.gas && !c.finished && c.v > 15) {
+      ctx.fillStyle = ORANGE;
+      ctx.fillRect(-20 - Math.random() * 6, -4, 8, 8);
+      ctx.fillStyle = YELLOW;
+      ctx.fillRect(-16, -2, 4, 4);
+    }
+
+    ctx.fillStyle = '#0b0720';
+    for (const [wx, wy] of [[-10, -10], [-10, 5], [6, -10], [6, 5]]) ctx.fillRect(wx, wy, 9, 5);
+    ctx.fillStyle = COLORS[p.slot];
+    ctx.fillRect(-14, -7, 30, 14);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(-14, -1, 30, 2);
+    ctx.fillStyle = '#0b0720';
+    ctx.fillRect(0, -5, 9, 10);
+    ctx.fillStyle = '#9ff3ff';
+    ctx.fillRect(1, -4, 7, 8);
+    ctx.fillStyle = YELLOW;
+    ctx.fillRect(14, -6, 3, 3);
+    ctx.fillRect(14, 3, 3, 3);
+    ctx.fillStyle = RED;
+    ctx.fillRect(-15, -6, 2, 3);
+    ctx.fillRect(-15, 3, 2, 3);
+    ctx.restore();
+
+    bigText(`P${p.slot + 1}`, c.y - 14, 12, COLORS[p.slot], 'center', c.x);
+  }
+
+  const race = {
+    title: 'GRAND PRIX',
+    tagline: 'One lap. Fastest car wins.',
+    controls: 'Hold GAS and turn your phone like a steering wheel',
+    button: 'GAS',
+    finishCount: 0,
+    firstFinishAt: 0,
+
+    prepare(ps) {
+      this.finishCount = 0;
+      this.firstFinishAt = 0;
+      ps.forEach((p) => { p.input.gas = false; resetCar(p); });
+    },
+
+    update(now, dt, t) {
+      const ps = active();
+      for (const p of ps) {
+        stepCar(p, dt);
+        const c = p.car;
+        if (!c.finished && c.progress >= LAP) {
+          c.finished = true;
+          c.finishTime = t;
+          c.place = ++this.finishCount;
+          if (!this.firstFinishAt) this.firstFinishAt = now;
+          sendPhase(p);
+        }
+      }
+      const allDone = ps.every((p) => p.car.finished);
+      return allDone || t > RACE_TIME_LIMIT || (this.firstFinishAt && now - this.firstFinishAt > RACE_GRACE_MS);
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => {
+          if (a.car.finished !== b.car.finished) return a.car.finished ? -1 : 1;
+          if (a.car.finished) return a.car.place - b.car.place;
+          return b.car.progress - a.car.progress;
+        })
+        .map((p) => ({ p, label: p.car.finished ? `${p.car.finishTime.toFixed(2)}s` : 'DNF' }));
+    },
+
+    phoneText(p) {
+      if (p.car.finished) return `Finished ${ordinal(p.car.place)}! ${p.car.finishTime.toFixed(2)}s`;
+      return 'GO! Hold GAS, turn like a wheel';
+    },
+
+    draw(now, t) {
+      ctx.drawImage(trackCanvas, 0, 0);
+      active().forEach(drawCar);
+
+      // Live standings, top left
+      const standings = active().sort((a, b) => {
+        if (a.car.finished !== b.car.finished) return a.car.finished ? -1 : 1;
+        if (a.car.finished) return a.car.place - b.car.place;
+        return b.car.progress - a.car.progress;
+      });
+      panel(8, 8, 200, standings.length * 24 + 16, CYAN);
+      standings.forEach((p, i) => {
+        ctx.fillStyle = COLORS[p.slot];
+        ctx.fillRect(20, 24 + i * 24, 12, 12);
+        const tail = p.car.finished ? ` ${p.car.finishTime.toFixed(1)}s` : '';
+        bigText(`${i + 1}. P${p.slot + 1}${tail}`, 35 + i * 24, 12, '#fff', 'left', 40);
+      });
+      if (phase === 'play') {
+        panel(W - 120, 8, 112, 36, CYAN);
+        bigText(`${t.toFixed(1)}s`, 33, 14, '#fff', 'right', W - 20);
+      }
+
+      // Dashboard in the infield: speed bar and readout for each driver
+      const ps = active();
+      panel(CX - 112, CY - 34, 224, ps.length * 14 + 14, '#8a8aa0', 'rgba(0,0,40,0.92)');
+      ps.forEach((p, i) => {
+        const y = CY - 22 + i * 14;
+        const speed = Math.round(p.car.v * 1.25);
+        ctx.fillStyle = '#2a2a3c';
+        ctx.fillRect(CX - 100, y - 8, 112, 8);
+        ctx.fillStyle = COLORS[p.slot];
+        ctx.fillRect(CX - 100, y - 8, 112 * clamp(p.car.v / MAX_SPEED, 0, 1), 8);
+        bigText(`${speed}`, y, 10, '#fff', 'right', CX + 100);
+      });
+    },
+  };
+
+  // ======================================================== GAME 2: TUG OF WAR
+
+  const TUG_TIME_LIMIT = 25;
+  const TUG_K = 0.0004;      // rope travel per unit of shake
+  const TUG_REF_RATE = 600;  // a hard shake, for scaling the power bars
+
+  const tug = {
+    title: 'TUG OF WAR',
+    tagline: 'Shake your phone to haul the rope to your side!',
+    controls: 'Shake as hard as you can. Teams: odd players against even players. A lone team faces the computer.',
+    button: 'SHAKE!',
+    pos: 0,          // -1 = team A wins, +1 = team B wins
+    teamSize: [0, 0],
+    aiTeam: [false, false],
+    winner: null,
+
+    prepare(ps) {
+      this.pos = 0;
+      this.winner = null;
+      this.teamSize = [0, 0];
+      ps.forEach((p) => {
+        p.tug = { energy: 0, total: 0, rate: 0 };
+        this.teamSize[p.slot % 2] += 1;
+      });
+      // If a side has nobody, the computer pulls for it
+      this.aiTeam = [this.teamSize[0] === 0, this.teamSize[1] === 0];
+    },
+
+    onShake(p, amount) {
+      if (!p.tug) return;
+      p.tug.energy += amount;
+      p.tug.total += amount;
+    },
+
+    update(now, dt, t) {
+      const pulls = [0, 0];
+      for (const p of active()) {
+        pulls[p.slot % 2] += p.tug.energy;
+        p.tug.rate += (p.tug.energy / Math.max(dt, 0.001) - p.tug.rate) * 0.15;
+        p.tug.energy = 0;
+      }
+      // Bigger teams help, but not enough to make 2v1 hopeless
+      for (let k = 0; k < 2; k++) pulls[k] /= Math.sqrt(Math.max(1, this.teamSize[k]));
+      for (let k = 0; k < 2; k++) {
+        if (this.aiTeam[k]) pulls[k] += (330 + 120 * Math.sin(t * 0.8)) * dt;
+      }
+      this.pos = clamp(this.pos + (pulls[1] - pulls[0]) * TUG_K, -1, 1);
+
+      if (Math.abs(this.pos) >= 1 || t > TUG_TIME_LIMIT) {
+        if (this.pos < 0) this.winner = 0;
+        else if (this.pos > 0) this.winner = 1;
+        else this.winner = null;
+        return true;
+      }
+      return false;
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => {
+          const aw = a.slot % 2 === this.winner, bw = b.slot % 2 === this.winner;
+          if (aw !== bw) return aw ? -1 : 1;
+          return b.tug.total - a.tug.total;
+        })
+        .map((p) => ({ p, label: p.slot % 2 === this.winner ? 'WIN' : 'LOSS' }));
+    },
+
+    phoneText() {
+      return 'SHAKE SHAKE SHAKE!';
+    },
+
+    draw(now, t) {
+      drawArcade(now);
+      shade(0.55);
+      titleText('TUG OF WAR', 66, 32, now);
+      if (phase === 'play') bigText(`${Math.max(0, TUG_TIME_LIMIT - t).toFixed(0)}`, 44, 22, CYAN, 'right', W - 24);
+
+      const teamColor = [ORANGE, CYAN];
+
+      // Meter: whoever is winning fills their half
+      const mx = 100, mw = 600, my = 100, mh = 24;
+      panel(mx, my, mw, mh, VIOLET, '#0b0720');
+      const mid = mx + mw / 2;
+      const reach = ((mw - 8) / 2) * Math.abs(this.pos);
+      ctx.fillStyle = this.pos < 0 ? teamColor[0] : teamColor[1];
+      if (this.pos < 0) ctx.fillRect(mid - reach, my + 4, reach, mh - 8);
+      else ctx.fillRect(mid, my + 4, reach, mh - 8);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(mid - 2, my, 4, mh);
+      bigText('TEAM A', 96, 12, teamColor[0], 'left', mx);
+      bigText('TEAM B', 96, 12, teamColor[1], 'right', mx + mw);
+
+      // Two cliffs over a pit of lava
+      const cliffY = 336;
+      const block = (x, y, w, h) => {
+        for (let by = y; by < y + h; by += 16) {
+          for (let bx = x; bx < x + w; bx += 16) {
+            ctx.fillStyle = ((bx + by) / 16) % 2 ? '#4a2a8a' : '#6b3fc0';
+            ctx.fillRect(bx, by, 16, 16);
+          }
+        }
+        ctx.fillStyle = GREEN;
+        ctx.fillRect(x, y, w, 6);
+      };
+      block(0, cliffY, 224, H - cliffY);
+      block(576, cliffY, 224, H - cliffY);
+      ctx.fillStyle = '#7a1018';
+      ctx.fillRect(224, 400, 352, 100);
+      for (let i = 0; i < 22; i++) {
+        const h = 16 + Math.sin(now / 220 + i * 1.3) * 6;
+        ctx.fillStyle = i % 2 ? ORANGE : '#ff6a1a';
+        ctx.fillRect(224 + i * 16, 400 - h + 16, 16, h + 84);
+      }
+
+      // The rope, a flag on its middle, and the edge markers
+      const ropeY = 306;
+      for (let x = 24; x < 776; x += 16) {
+        ctx.fillStyle = (x / 16) % 2 ? '#b06a2a' : '#e0a860';
+        ctx.fillRect(x, ropeY + Math.sin(x / 120) * 3, 16, 8);
+      }
+      const flagX = CX + this.pos * 190;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(flagX - 2, ropeY - 44, 4, 52);
+      ctx.fillStyle = RED;
+      ctx.fillRect(flagX + 2, ropeY - 44, 22, 8);
+      ctx.fillRect(flagX + 2, ropeY - 36, 14, 8);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      for (let y = 140; y < 400; y += 16) ctx.fillRect(CX - 2, y, 4, 8);
+
+      // The pullers lean back as they shake
+      const puller = (x, color, label, rate, dir, cpu) => {
+        const power = clamp(rate / TUG_REF_RATE, 0, 1);
+        const jitter = Math.sin(now / 40 + x) * 3 * power;
+        ctx.save();
+        ctx.translate(x + jitter, cliffY);
+        ctx.rotate(dir * (0.12 + 0.25 * power));
+        drawPerson(0, 0, 5, cpu ? '#8a8aa0' : color);
+        ctx.restore();
+        bigText(label, cliffY + 28, 12, color, 'center', x);
+        ctx.fillStyle = '#2a2a3c';
+        ctx.fillRect(x - 20, cliffY + 36, 40, 8);
+        ctx.fillStyle = color;
+        ctx.fillRect(x - 20, cliffY + 36, 40 * power, 8);
+      };
+
+      const sides = [[], []];
+      active().forEach((p) => sides[p.slot % 2].push(p));
+      for (let k = 0; k < 2; k++) {
+        const dir = k === 0 ? -1 : 1;   // lean away from the middle
+        const base = k === 0 ? 184 : 616;
+        const step = k === 0 ? -52 : 52;
+        let i = 0;
+        if (this.aiTeam[k]) {
+          puller(base, '#8a8aa0', 'CPU', 330 + 120 * Math.sin(t * 0.8), dir, true);
+          i = 1;
+        }
+        sides[k].forEach((p) => {
+          puller(base + i * step, COLORS[p.slot], `P${p.slot + 1}`, p.tug.rate, dir, false);
+          i += 1;
+        });
+      }
+    },
+  };
+
+  // ======================================================== GAME 3: BUMPER BALLS
+
+  const ARENA_START_R = 210;
+  const ARENA_MIN_R = 70;
+  const BALL_R = 16;
+  const ARENA_TIME_LIMIT = 60;
+  const DASH_COOLDOWN = 2;
+
+  const arena = {
+    title: 'BUMPER BALLS',
+    tagline: 'Knock everyone off the shrinking platform.',
+    controls: 'Hold your phone flat like a tray. Tilt to roll, tap DASH to bash!',
+    button: 'DASH',
+    radius: ARENA_START_R,
+
+    prepare(ps) {
+      this.radius = ARENA_START_R;
+      ps.forEach((p) => {
+        const a = p.slot * (LAP / MAX_PLAYERS) + Math.PI / 4;
+        p.ball = {
+          x: CX + Math.cos(a) * 100, y: CY + Math.sin(a) * 100,
+          vx: 0, vy: 0, alive: true, deathTime: null, dashCd: 0, flash: 0,
+          base: { beta: 0, gamma: 0 },
+        };
+      });
+    },
+
+    // Whatever angle the phone is held at when the game starts counts as "level"
+    begin(ps) {
+      ps.forEach((p) => {
+        p.ball.base = { beta: p.input.beta, gamma: p.input.gamma };
+      });
+    },
+
+    onButton(p, down) {
+      const b = p.ball;
+      if (!down || !b || !b.alive || b.dashCd > 0) return;
+      const speed = Math.hypot(b.vx, b.vy);
+      const dx = speed > 20 ? b.vx / speed : 0;
+      const dy = speed > 20 ? b.vy / speed : -1;
+      b.vx += dx * 380;
+      b.vy += dy * 380;
+      b.dashCd = DASH_COOLDOWN;
+      b.flash = 0.3;
+    },
+
+    update(now, dt, t) {
+      const ps = active();
+      this.radius = t < 4 ? ARENA_START_R : Math.max(ARENA_MIN_R, ARENA_START_R - (t - 4) * 3.2);
+
+      for (const p of ps) {
+        const b = p.ball;
+        if (!b.alive) continue;
+        // Like a tray: the ball rolls toward the edge you lower
+        const ax = clamp((p.input.gamma - b.base.gamma) / 25, -1, 1) * 260;
+        const ay = clamp((p.input.beta - b.base.beta) / 25, -1, 1) * 260;
+        b.vx += ax * dt;
+        b.vy += ay * dt;
+        const drag = Math.pow(0.5, dt / 0.6);
+        b.vx *= drag;
+        b.vy *= drag;
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.dashCd = Math.max(0, b.dashCd - dt);
+        b.flash = Math.max(0, b.flash - dt);
+      }
+
+      // Bumping: equal masses, a bit bouncier than real life
+      const alive = ps.filter((p) => p.ball.alive);
+      for (let i = 0; i < alive.length; i++) {
+        for (let j = i + 1; j < alive.length; j++) {
+          const a = alive[i].ball, b = alive[j].ball;
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy) || 0.001;
+          if (dist >= BALL_R * 2) continue;
+          const nx = dx / dist, ny = dy / dist;
+          const overlap = BALL_R * 2 - dist;
+          a.x -= nx * overlap / 2; a.y -= ny * overlap / 2;
+          b.x += nx * overlap / 2; b.y += ny * overlap / 2;
+          const approach = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+          if (approach > 0) {
+            const j2 = approach * 1.1;
+            a.vx -= j2 * nx; a.vy -= j2 * ny;
+            b.vx += j2 * nx; b.vy += j2 * ny;
+          }
+        }
+      }
+
+      for (const p of alive) {
+        const b = p.ball;
+        if (Math.hypot(b.x - CX, b.y - CY) > this.radius + 6) {
+          b.alive = false;
+          b.deathTime = t;
+          sendPhase(p);
+        }
+      }
+
+      const left = ps.filter((p) => p.ball.alive).length;
+      return left <= (ps.length > 1 ? 1 : 0) || t > ARENA_TIME_LIMIT;
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => {
+          if (a.ball.alive !== b.ball.alive) return a.ball.alive ? -1 : 1;
+          return (b.ball.deathTime || 0) - (a.ball.deathTime || 0);
+        })
+        .map((p) => ({ p, label: p.ball.alive ? 'STANDING' : `out ${p.ball.deathTime.toFixed(1)}s` }));
+    },
+
+    phoneText(p) {
+      return p.ball.alive ? 'Tilt to roll. Tap DASH to bash!' : 'You fell! Watch the chaos';
+    },
+
+    draw(now, t) {
+      const R = this.radius;
+      const danger = R < 120;
+
+      // The pit: dark, with a scrolling neon grid
+      ctx.fillStyle = '#0b0720';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#2b1a63';
+      const off = Math.floor(now / 60) % 40;
+      for (let x = -off; x < W; x += 40) ctx.fillRect(x, 0, 4, H);
+      for (let y = -off; y < H; y += 40) ctx.fillRect(0, y, W, 4);
+
+      // The platform: a checkered disc
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(CX, CY, R, 0, LAP);
+      ctx.clip();
+      for (let y = CY - 220; y < CY + 220; y += 32) {
+        for (let x = CX - 220; x < CX + 220; x += 32) {
+          ctx.fillStyle = ((x - CX + 220) / 32 + (y - CY + 220) / 32) % 2 ? '#c0289c' : '#6b3fc0';
+          ctx.fillRect(x, y, 32, 32);
+        }
+      }
+      ctx.restore();
+      ctx.beginPath();
+      ctx.arc(CX, CY, R, 0, LAP);
+      ctx.lineWidth = 8;
+      const flicker = danger && Math.floor(now / 150) % 2 === 0;
+      ctx.strokeStyle = flicker ? '#ffffff' : danger ? RED : YELLOW;
+      ctx.stroke();
+
+      // Bumper balls
+      for (const p of active()) {
+        const b = p.ball;
+        if (!b.alive) continue;
+        const color = COLORS[p.slot];
+        if (b.flash > 0) {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, BALL_R + 10, 0, LAP);
+          ctx.fillStyle = 'rgba(255,255,255,0.45)';
+          ctx.fill();
+        }
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.beginPath();
+        ctx.ellipse(b.x + 4, b.y + 8, BALL_R, BALL_R * 0.8, 0, 0, LAP);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, BALL_R, 0, LAP);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#0b0720';
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(b.x - 9, b.y - 10, 8, 8);
+        if (b.dashCd <= 0) {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, BALL_R + 7, 0, LAP);
+          ctx.lineWidth = 4;
+          ctx.strokeStyle = '#ffffff';
+          ctx.stroke();
+        }
+        bigText(String(p.slot + 1), b.y + 8, 14, '#0b0720', 'center', b.x + 3);
+      }
+
+      const out = active().filter((p) => !p.ball.alive);
+      out.forEach((p, i) => bigText(`P${p.slot + 1} OUT`, 30 + i * 22, 14, COLORS[p.slot], 'left', 14));
+    },
+  };
+
+  // Turning angle of the phone, taken from gravity when available
+  const wheelOf = (p) => (p.input.wheel === null || p.input.wheel === undefined ? p.input.gamma : p.input.wheel);
+  const angleDiff = (a, b) => {
+    let d = a - b;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    return d;
+  };
+
+  const sortedActive = () => active().sort((a, b) => a.slot - b.slot);
+
+  // ===================================================== GAME 4: FRUIT CATCH
+
+  const FRUIT_TIME = 30;
+  const BASKET_W = 64;
+  const BASKET_Y = 436;
+  const MAGNET_RADIUS = 140;
+  const MAGNET_TIME = 1.2;
+  const MAGNET_COOLDOWN = 3;
+
+  const FRUIT_TYPES = [
+    { id: 'apple', pts: 1, weight: 38, map: ['...gg...', '..rrrr..', '.rwrrrr.', '.rrrrrr.', '.rrrrrr.', '.rrrrrr.', '..rrrr..', '...rr...'], colors: { r: '#e8575a', g: '#7fd45a', w: '#ff8ad8' } },
+    { id: 'orange', pts: 1, weight: 28, map: ['...gg...', '..oooo..', '.owoooo.', '.oooooo.', '.oooooo.', '.oooooo.', '..oooo..', '...oo...'], colors: { o: '#e8a030', g: '#7fd45a', w: '#ffe83a' } },
+    { id: 'banana', pts: 2, weight: 18, map: ['......yy', '.....yyy', '....yyy.', '...yyyb.', '..yyyb..', '.yyyb...', 'yyyb....', 'yyb.....'], colors: { y: '#f0d050', b: '#b06a2a' } },
+    { id: 'gold', pts: 5, weight: 6, map: ['...yy...', '...yy...', 'yyyyyyyy', '.yyyyyy.', '..yyyy..', '..yyyy..', '.yy..yy.', '.y....y.'], colors: { y: '#ffe83a' } },
+    { id: 'rotten', pts: -2, weight: 16, map: ['...gg...', '..dddd..', '.dkdddd.', '.dddkdd.', '.dkdddd.', '.dddddd.', '..dddd..', '...dd...'], colors: { d: '#1f7a3a', k: '#6b3a1a', g: '#6b3a1a' } },
+  ];
+  const pickFruit = () => {
+    const total = FRUIT_TYPES.reduce((s, f) => s + f.weight, 0);
+    let r = Math.random() * total;
+    for (const f of FRUIT_TYPES) {
+      r -= f.weight;
+      if (r <= 0) return f;
+    }
+    return FRUIT_TYPES[0];
+  };
+
+  const fruit = {
+    title: 'FRUIT CATCH',
+    tagline: 'Slide your basket to catch the fruit. Skip the rotten ones!',
+    controls: 'Turn your phone like a wheel to slide your basket. Shake it or press MAGNET to pull nearby fruit in.',
+    button: 'MAGNET',
+    items: [],
+
+    prepare(ps) {
+      this.items = [];
+      ps.forEach((p) => {
+        p.fruit = { score: 0, x: 0, spawnT: 0.6, cd: 0, magnet: 0, shakeAcc: 0, turn: 0, base: 0, flash: 0 };
+      });
+    },
+
+    // Wherever the phone is held when the game starts counts as "level"
+    begin(ps) {
+      ps.forEach((p) => { p.fruit.base = wheelOf(p); });
+    },
+
+    fireMagnet(p) {
+      const f = p.fruit;
+      if (!f || f.cd > 0) return;
+      f.magnet = MAGNET_TIME;
+      f.cd = MAGNET_COOLDOWN;
+      f.shakeAcc = 0;
+      sendPhase(p);
+    },
+
+    onShake(p, amount) {
+      if (p.fruit) p.fruit.shakeAcc += amount;
+    },
+
+    onButton(p, down) {
+      if (down) this.fireMagnet(p);
+    },
+
+    update(now, dt, t) {
+      const ps = sortedActive();
+      const laneW = W / ps.length;
+
+      ps.forEach((p, i) => {
+        const f = p.fruit;
+        const cx = i * laneW + laneW / 2;
+        f.turn = clamp(angleDiff(wheelOf(p), f.base) / 35, -1, 1);
+        const target = cx + f.turn * (laneW / 2 - BASKET_W / 2 - 6);
+        if (!f.x) f.x = cx;
+        f.x += (target - f.x) * Math.min(1, dt * 14);
+
+        f.shakeAcc *= Math.pow(0.15, dt);
+        if (f.shakeAcc >= 180) this.fireMagnet(p);
+        f.cd = Math.max(0, f.cd - dt);
+        f.magnet = Math.max(0, f.magnet - dt);
+        f.flash = Math.max(0, f.flash - dt);
+
+        f.spawnT -= dt;
+        if (f.spawnT <= 0 && t < FRUIT_TIME - 1.2) {
+          const type = pickFruit();
+          this.items.push({
+            owner: p, type, x: i * laneW + 24 + Math.random() * (laneW - 48), y: -16,
+            vy: 130 + Math.random() * 80 + t * 2,
+          });
+          f.spawnT = 0.5 + Math.random() * 0.5 - Math.min(0.2, t * 0.006);
+        }
+      });
+
+      this.items = this.items.filter((it) => {
+        const f = it.owner.fruit;
+        if (f.magnet > 0) {
+          const dx = f.x - it.x, dy = BASKET_Y - it.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < MAGNET_RADIUS && dist > 1) {
+            it.x += (dx / dist) * 420 * dt;
+            it.y += (dy / dist) * 420 * dt;
+          }
+        }
+        it.y += it.vy * dt;
+        if (Math.abs(it.x - f.x) < BASKET_W / 2 + 6 && it.y >= BASKET_Y - 8 && it.y <= BASKET_Y + 22) {
+          f.score = Math.max(0, f.score + it.type.pts);
+          f.flash = 0.25;
+          return false;
+        }
+        return it.y < H + 20;
+      });
+
+      return t >= FRUIT_TIME;
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => b.fruit.score - a.fruit.score)
+        .map((p) => ({ p, label: `${p.fruit.score} pts` }));
+    },
+
+    phoneText(p) {
+      return p.fruit.cd > 0 && p.fruit.magnet > 0 ? 'MAGNET ON!' : 'Turn to slide. Shake or MAGNET!';
+    },
+
+    draw(now, t) {
+      drawArcade(now);
+      shade(0.6);
+      titleText('FRUIT CATCH', 56, 28, now);
+      if (phase === 'play') bigText(`${Math.max(0, FRUIT_TIME - t).toFixed(0)}`, 44, 22, CYAN, 'right', W - 24);
+
+      const ps = sortedActive();
+      const laneW = W / ps.length;
+      ps.forEach((p, i) => {
+        const x0 = i * laneW, f = p.fruit, color = COLORS[p.slot];
+        if (i > 0) {
+          ctx.fillStyle = '#2a3060';
+          for (let y = 90; y < H; y += 24) ctx.fillRect(x0 - 2, y, 4, 12);
+        }
+        bigText(`P${p.slot + 1}  ${f.score}`, 96, 16, color, 'center', x0 + laneW / 2);
+
+        // Magnet field
+        if (f.magnet > 0) {
+          const pulse = (now / 120) % 1;
+          ctx.strokeStyle = YELLOW;
+          ctx.lineWidth = 4;
+          ctx.setLineDash([12, 12]);
+          ctx.beginPath();
+          ctx.arc(f.x, BASKET_Y, MAGNET_RADIUS * (0.7 + pulse * 0.3), Math.PI, LAP);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // Basket
+        const bx = f.x;
+        ctx.fillStyle = f.flash > 0 ? '#ffffff' : color;
+        ctx.fillRect(bx - BASKET_W / 2 - 4, BASKET_Y - 4, BASKET_W + 8, 8);
+        ctx.fillStyle = '#b06a2a';
+        ctx.fillRect(bx - BASKET_W / 2 + 2, BASKET_Y + 4, BASKET_W - 4, 20);
+        ctx.fillStyle = '#6b3a1a';
+        for (let k = 0; k < 6; k++) ctx.fillRect(bx - BASKET_W / 2 + 6 + k * 10, BASKET_Y + 4, 3, 20);
+        ctx.fillRect(bx - BASKET_W / 2 + 2, BASKET_Y + 12, BASKET_W - 4, 3);
+
+        // Magnet cooldown
+        ctx.fillStyle = '#2a2a3c';
+        ctx.fillRect(bx - 30, BASKET_Y + 32, 60, 8);
+        ctx.fillStyle = f.cd > 0 ? '#8a8aa0' : GREEN;
+        ctx.fillRect(bx - 30, BASKET_Y + 32, 60 * (1 - f.cd / MAGNET_COOLDOWN), 8);
+      });
+
+      this.items.forEach((it) => {
+        const s = it.type;
+        drawSprite(s.map, s.colors, it.x - 12, it.y - 12, 3);
+      });
+    },
+  };
+
+  // ==================================================== GAME 5: PAPER PLANES
+
+  const PLANE_TIME = 45;
+  const THROWS = 6;
+  const LAUNCH_X = 76;
+  const PLANE_SPRITE = ['ww......', 'wwwww...', 'ccwwwwww', 'wwwww...', 'ww......'];
+
+  const plane = {
+    title: 'PAPER PLANES',
+    tagline: 'Flick your phone to throw a plane at the targets!',
+    controls: 'Tilt the phone to aim up or down, then flick it forward. A harder flick flies farther. Or tap THROW for a medium toss.',
+    button: 'THROW',
+    targets: [],
+    planes: [],
+
+    prepare(ps) {
+      this.planes = [];
+      this.targets = [];
+      ps.forEach((p) => {
+        p.plane = { score: 0, throws: THROWS, aim: 0, base: 0, cd: 0, power: 0 };
+      });
+      for (let k = 0; k < 3; k++) this.spawnTarget(0);
+    },
+
+    // Whatever angle the phone is held at when the game starts counts as "level"
+    begin(ps) {
+      ps.forEach((p) => { p.plane.base = p.input.beta; });
+    },
+
+    spawnTarget(t) {
+      const small = Math.random() > 0.5;
+      const x = 300 + Math.random() * 440, y = 100 + Math.random() * 310;
+      this.targets.push({
+        x, y, r: small ? 18 : 28, born: t, hit: 0,
+        pts: Math.round(1 + (x - 120) / 120) + (small ? 1 : 0),
+      });
+    },
+
+    launchY(p) {
+      const n = sortedActive().length;
+      return (n > 4 ? 116 : 130) + sortedActive().indexOf(p) * (n > 4 ? 62 : 88);
+    },
+
+    launch(p, power) {
+      const s = p.plane;
+      if (phase !== 'play' || !s || s.throws <= 0 || s.cd > 0) return;
+      s.throws -= 1;
+      s.cd = 0.6;
+      s.power = power;
+      const angle = (s.aim * Math.PI) / 180;
+      const speed = 250 + power * 560;
+      this.planes.push({
+        p, x: LAUNCH_X, y: this.launchY(p), vx: Math.cos(angle) * speed, vy: -Math.sin(angle) * speed, trail: [],
+      });
+      sendPhase(p);
+    },
+
+    onFlick(p, peak) {
+      this.launch(p, clamp((peak - 10) / 28, 0.05, 1));
+    },
+
+    onButton(p, down) {
+      if (down) this.launch(p, 0.45);
+    },
+
+    update(now, dt, t) {
+      for (const p of active()) {
+        const s = p.plane;
+        // The aim lags a little so the flick itself does not bend the shot
+        const raw = clamp(p.input.beta - s.base, -40, 40);
+        s.aim += (raw - s.aim) * Math.min(1, dt * 3);
+        s.cd = Math.max(0, s.cd - dt);
+      }
+
+      let respawns = 0;
+      this.targets = this.targets.filter((tg) => {
+        if (tg.hit > 0) {
+          tg.hit -= dt;
+          if (tg.hit <= 0) { respawns += 1; return false; }
+          return true;
+        }
+        if (t - tg.born > 10) { respawns += 1; return false; }
+        return true;
+      });
+      for (let k = 0; k < respawns; k++) this.spawnTarget(t);
+
+      this.planes = this.planes.filter((pl) => {
+        pl.vx *= Math.pow(0.4, dt);
+        pl.vy = pl.vy * Math.pow(0.4, dt) + 150 * dt;
+        pl.x += pl.vx * dt;
+        pl.y += pl.vy * dt;
+        pl.trail.push([pl.x, pl.y]);
+        if (pl.trail.length > 10) pl.trail.shift();
+        for (const tg of this.targets) {
+          if (tg.hit > 0) continue;
+          if (Math.hypot(pl.x - tg.x, pl.y - tg.y) < tg.r + 8) {
+            pl.p.plane.score += tg.pts;
+            tg.hit = 0.5;
+            return false;
+          }
+        }
+        return pl.x < W + 30 && pl.y < H + 20 && pl.y > -30 && Math.hypot(pl.vx, pl.vy) > 40;
+      });
+
+      const noThrows = active().every((p) => p.plane.throws <= 0);
+      return t >= PLANE_TIME || (noThrows && this.planes.length === 0);
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => b.plane.score - a.plane.score)
+        .map((p) => ({ p, label: `${p.plane.score} pts` }));
+    },
+
+    phoneText(p) {
+      return `Tilt to aim, then FLICK! ${p.plane.throws} left`;
+    },
+
+    draw(now, t) {
+      drawArcade(now);
+      shade(0.6);
+      titleText('PAPER PLANES', 56, 28, now);
+      if (phase === 'play') bigText(`${Math.max(0, PLANE_TIME - t).toFixed(0)}`, 44, 22, CYAN, 'right', W - 24);
+
+      // Targets: bullseye rings, with their point value
+      this.targets.forEach((tg) => {
+        const blink = tg.hit > 0 && Math.floor(now / 80) % 2 === 0;
+        [1, 0.66, 0.33].forEach((k, i) => {
+          ctx.beginPath();
+          ctx.arc(tg.x, tg.y, tg.r * k, 0, LAP);
+          ctx.fillStyle = blink ? '#ffffff' : i % 2 ? '#ffffff' : RED;
+          ctx.fill();
+        });
+        bigText(`${tg.pts}`, tg.y + tg.r + 18, 12, YELLOW, 'center', tg.x);
+      });
+
+      // Launchers
+      sortedActive().forEach((p) => {
+        const s = p.plane, y = this.launchY(p), color = COLORS[p.slot];
+        const tight = sortedActive().length > 4;
+        drawPerson(36, y + (tight ? 14 : 24), tight ? 2 : 3, color);
+        bigText(`P${p.slot + 1}  ${s.score}`, y + (tight ? 28 : 48), 11, color, 'left', 8);
+        ctx.fillStyle = color;
+        for (let k = 0; k < s.throws; k++) ctx.fillRect(8 + k * 12, y + (tight ? 36 : 56), 8, 6);
+        // Aim line
+        const a = (s.aim * Math.PI) / 180;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 4;
+        ctx.setLineDash([8, 8]);
+        ctx.beginPath();
+        ctx.moveTo(LAUNCH_X, y);
+        ctx.lineTo(LAUNCH_X + Math.cos(a) * 90, y - Math.sin(a) * 90);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      });
+
+      // Planes in flight
+      this.planes.forEach((pl) => {
+        pl.trail.forEach(([tx, ty], i) => {
+          ctx.fillStyle = i % 2 ? '#8a8aa0' : '#c8c8d8';
+          ctx.fillRect(tx - 2, ty - 2, 4, 4);
+        });
+        ctx.save();
+        ctx.translate(pl.x, pl.y);
+        ctx.rotate(Math.atan2(pl.vy, pl.vx));
+        drawSprite(PLANE_SPRITE, { w: '#ffffff', c: COLORS[pl.p.slot] }, -16, -10, 4);
+        ctx.restore();
+      });
+    },
+  };
+
+  // ====================================================== GAME 6: HOT POTATO
+
+  const BOMB_FLIGHT = 0.35;
+  const BOMB_SPRITE = [
+    '.......o..', '......o.o.', '.....kk...', '...kkkkkk.', '..kkkkkkkk', '.kkwkkkkkk', '.kwwkkkkkk', '.kkkkkkkkk', '..kkkkkkk.', '...kkkkk..',
+  ];
+
+  const potato = {
+    title: 'HOT POTATO',
+    tagline: 'Do not be holding the bomb when it blows!',
+    controls: 'Shake to toss the bomb to a neighbor. Or turn your phone to pick a player and press TOSS.',
+    button: 'TOSS',
+    seats: [],
+    holder: 0,
+    timer: 0,
+    lock: 0,
+    flight: null,
+    pause: 0,
+    boom: null,
+    over: false,
+    outs: 0,
+
+    prepare(ps) {
+      const list = ps.slice().sort((a, b) => a.slot - b.slot);
+      this.seats = list.map((p) => ({ p, name: `P${p.slot + 1}`, color: COLORS[p.slot], alive: true, bot: false, out: null, act: 0 }));
+      p_ensureBots(this.seats);
+      list.forEach((p) => { p.potato = { sel: 0, latch: false, shakeAcc: 0, base: 0 }; });
+      this.over = false;
+      this.outs = 0;
+      this.flight = null;
+      this.pause = 0;
+      this.boom = null;
+      this.respawn();
+    },
+
+    respawn() {
+      const alive = this.seats.filter((s) => s.alive);
+      this.holder = this.seats.indexOf(alive[Math.floor(Math.random() * alive.length)]);
+      this.timer = 6 + Math.random() * 6;
+      this.receive(this.holder);
+    },
+
+    receive(idx) {
+      this.holder = idx;
+      this.lock = 0.6;
+      const s = this.seats[idx];
+      s.act = 0.9 + Math.random() * 1.3;
+      if (s.p) {
+        s.p.potato.sel = 0;
+        s.p.potato.latch = false;
+        s.p.potato.shakeAcc = 0;
+        s.p.potato.base = wheelOf(s.p);
+      }
+      sendPhaseToAll();
+    },
+
+    // Alive seats in circle order, starting just after the holder
+    others() {
+      const n = this.seats.length, out = [];
+      for (let k = 1; k < n; k++) {
+        const s = this.seats[(this.holder + k) % n];
+        if (s.alive) out.push((this.holder + k) % n);
+      }
+      return out;
+    },
+
+    toss(toIdx) {
+      if (this.flight || this.pause > 0 || this.lock > 0 || toIdx === undefined) return;
+      this.flight = { from: this.holder, to: toIdx, t: 0 };
+      sendPhaseToAll();
+    },
+
+    tossToNeighbor() {
+      const o = this.others();
+      if (o.length === 0) return;
+      this.toss(Math.random() < 0.5 ? o[0] : o[o.length - 1]);
+    },
+
+    isHolder(p) {
+      const s = this.seats[this.holder];
+      return !!s && s.p === p;
+    },
+
+    onShake(p, amount) {
+      if (p.potato && this.isHolder(p)) p.potato.shakeAcc += amount;
+    },
+
+    onButton(p, down) {
+      if (!down || !this.isHolder(p)) return;
+      const o = this.others();
+      this.toss(o[p.potato.sel % Math.max(1, o.length)]);
+    },
+
+    update(now, dt) {
+      if (this.pause > 0) {
+        this.pause -= dt;
+        if (this.pause <= 0) {
+          const humansLeft = this.seats.some((s) => s.alive && !s.bot);
+          const left = this.seats.filter((s) => s.alive).length;
+          if (left <= 1 || !humansLeft) return true;
+          this.boom = null;
+          this.respawn();
+        }
+        return false;
+      }
+
+      if (this.flight) {
+        this.flight.t += dt / BOMB_FLIGHT;
+        if (this.flight.t >= 1) {
+          const to = this.flight.to;
+          this.flight = null;
+          this.receive(to);
+        }
+        this.timer -= dt;
+      } else {
+        this.timer -= dt;
+        this.lock = Math.max(0, this.lock - dt);
+        const seat = this.seats[this.holder];
+        if (seat.bot) {
+          seat.act -= dt;
+          if (seat.act <= 0 && this.lock <= 0) this.tossToNeighbor();
+        } else if (seat.p && this.lock <= 0) {
+          const pt = seat.p.potato;
+          pt.shakeAcc *= Math.pow(0.15, dt);
+          if (pt.shakeAcc >= 220) {
+            pt.shakeAcc = 0;
+            this.tossToNeighbor();
+          } else {
+            // Turning the phone moves the selection around the circle
+            const diff = angleDiff(wheelOf(seat.p), pt.base);
+            const n = Math.max(1, this.others().length);
+            if (diff > 25 && !pt.latch) { pt.sel = (pt.sel + 1) % n; pt.latch = true; }
+            else if (diff < -25 && !pt.latch) { pt.sel = (pt.sel - 1 + n) % n; pt.latch = true; }
+            else if (Math.abs(diff) < 12) pt.latch = false;
+          }
+        }
+      }
+
+      if (this.timer <= 0) {
+        const seat = this.seats[this.holder];
+        const wasFlying = this.flight;
+        const victim = wasFlying ? this.seats[this.flight.to] : seat;
+        victim.alive = false;
+        victim.out = ++this.outs;
+        this.boom = { idx: this.seats.indexOf(victim), at: now };
+        this.flight = null;
+        this.pause = 1.7;
+        sendPhaseToAll();
+      }
+      return false;
+    },
+
+    ranking() {
+      const humans = this.seats.filter((s) => !s.bot);
+      return humans
+        .sort((a, b) => {
+          if (a.alive !== b.alive) return a.alive ? -1 : 1;
+          return (b.out || 0) - (a.out || 0);
+        })
+        .map((s) => ({ p: s.p, label: s.alive ? 'LAST STANDING' : `out #${s.out}` }));
+    },
+
+    phoneText(p) {
+      const seat = this.seats.find((s) => s.p === p);
+      if (!seat || !seat.alive) return 'BOOM! You are out';
+      if (this.isHolder(p) && !this.flight) return 'YOU HAVE THE BOMB! Shake, or turn + TOSS!';
+      return 'Dodge! Do not get it...';
+    },
+
+    seatPos(i) {
+      const n = this.seats.length;
+      const a = -Math.PI / 2 + (i / n) * LAP;
+      return { x: CX + Math.cos(a) * 290, y: 292 + Math.sin(a) * 118 };
+    },
+
+    draw(now, t) {
+      drawArcade(now);
+      shade(0.55);
+      titleText('HOT POTATO', 56, 28, now);
+
+      const seatsNow = this.seats;
+      // The table
+      ctx.fillStyle = '#2a1f48';
+      ctx.beginPath();
+      ctx.ellipse(CX, 300, 250, 92, 0, 0, LAP);
+      ctx.fill();
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#4a2a8a';
+      ctx.stroke();
+
+      // Countdown in the middle of the table
+      const low = this.timer < 3;
+      const flash = low && Math.floor(now / 150) % 2 === 0;
+      bigText(`${Math.max(0, this.timer).toFixed(1)}`, 322, 46, flash ? '#ffffff' : low ? RED : YELLOW);
+      bigText('FUSE', 270, 12, '#c8c8d8');
+
+      seatsNow.forEach((s, i) => {
+        const pos = this.seatPos(i);
+        const alpha = s.alive ? 1 : 0.25;
+        drawPerson(pos.x, pos.y + 36, 4, s.color, alpha);
+        bigText(s.name, pos.y + 58, 13, s.alive ? s.color : '#5c5c78', 'center', pos.x);
+      });
+
+      // Who the holder is aiming at
+      const holderSeat = seatsNow[this.holder];
+      if (holderSeat && holderSeat.alive && !holderSeat.bot && !this.flight && this.pause <= 0) {
+        const o = this.others();
+        if (o.length) {
+          const target = o[holderSeat.p.potato.sel % o.length];
+          const a = this.seatPos(this.holder), b = this.seatPos(target);
+          ctx.strokeStyle = GREEN;
+          ctx.lineWidth = 4;
+          ctx.setLineDash([10, 10]);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y - 20);
+          ctx.lineTo(b.x, b.y - 20);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = GREEN;
+          ctx.fillRect(b.x - 8, b.y - 100 - (Math.floor(now / 200) % 2) * 4, 16, 10);
+          bigText(`${holderSeat.name} AIMS AT ${seatsNow[target].name}`, 90, 11, GREEN);
+        }
+      }
+
+      // The bomb: on the holder's head, or flying between two seats
+      if (this.pause <= 0) {
+        let bx, by;
+        if (this.flight) {
+          const a = this.seatPos(this.flight.from), b = this.seatPos(this.flight.to), k = this.flight.t;
+          bx = a.x + (b.x - a.x) * k;
+          by = a.y + (b.y - a.y) * k - Math.sin(k * Math.PI) * 70 - 66;
+        } else {
+          const a = this.seatPos(this.holder);
+          bx = a.x;
+          by = a.y - 66 + Math.sin(now / 90) * 3;
+        }
+        const spark = Math.floor(now / (low ? 70 : 140)) % 2 === 0;
+        drawSprite(BOMB_SPRITE, { k: '#2a2a3c', w: '#8a8aa0', o: spark ? YELLOW : ORANGE }, bx - 25, by - 25, 5);
+      } else if (this.boom) {
+        // Explosion burst where the holder was
+        const pos = this.seatPos(this.boom.idx);
+        const k = 1 - this.pause / 1.7;
+        for (let i = 0; i < 14; i++) {
+          const a = (i / 14) * LAP;
+          const d = 14 + k * 70;
+          ctx.fillStyle = i % 3 === 0 ? '#ffffff' : i % 3 === 1 ? YELLOW : ORANGE;
+          ctx.fillRect(pos.x + Math.cos(a) * d - 6, pos.y - 20 + Math.sin(a) * d - 6, 12, 12);
+        }
+        bigText(`BOOM! ${seatsNow[this.boom.idx].name} IS OUT`, 90, 16, RED);
+      }
+    },
+  };
+
+  function p_ensureBots(seats) {
+    let k = 1;
+    while (seats.length < 3) {
+      seats.push({ p: null, name: `CPU${k}`, color: '#8a8aa0', alive: true, bot: true, out: null, act: 0 });
+      k += 1;
+    }
+  }
+
+  // ======================================================== GAME 7: MOTION SAYS
+
+  const SIMON_PAUSE = 1.4;
+  const SIMON_RESULT = 1.3;
+  const SIMON_MAX_ROUNDS = 12;
+  const SIMON_COMMANDS = [
+    { id: 'shake', text: 'SHAKE!', hint: 'Shake your phone' },
+    { id: 'tap', text: 'TAP!', hint: 'Tap the big button' },
+    { id: 'left', text: 'TURN LEFT', hint: 'Turn the phone like a wheel, to the left' },
+    { id: 'right', text: 'TURN RIGHT', hint: 'Turn the phone like a wheel, to the right' },
+    { id: 'up', text: 'TILT UP', hint: 'Raise the top of the phone toward the ceiling' },
+    { id: 'down', text: 'TILT DOWN', hint: 'Lower the top of the phone toward the floor' },
+  ];
+
+  function drawGlyph(id, x, y, s, color, now) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 12;
+    ctx.lineCap = 'butt';
+    ctx.lineJoin = 'miter';
+
+    if (id === 'left' || id === 'right') {
+      if (id === 'left') ctx.scale(-1, 1);
+      const r = s * 0.7;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, -Math.PI * 0.9, Math.PI * 0.5);
+      ctx.stroke();
+      // Arrowhead at the end of the arc, pointing along the turn
+      ctx.beginPath();
+      ctx.moveTo(-s * 0.1, r + s * 0.34);
+      ctx.lineTo(-s * 0.1 - s * 0.34, r);
+      ctx.lineTo(-s * 0.1, r - s * 0.34);
+      ctx.closePath();
+      ctx.fill();
+    } else if (id === 'up' || id === 'down') {
+      if (id === 'down') ctx.scale(1, -1);
+      ctx.beginPath();
+      ctx.moveTo(0, -s);
+      ctx.lineTo(s * 0.6, -s * 0.25);
+      ctx.lineTo(s * 0.22, -s * 0.25);
+      ctx.lineTo(s * 0.22, s * 0.8);
+      ctx.lineTo(-s * 0.22, s * 0.8);
+      ctx.lineTo(-s * 0.22, -s * 0.25);
+      ctx.lineTo(-s * 0.6, -s * 0.25);
+      ctx.closePath();
+      ctx.fill();
+    } else if (id === 'shake') {
+      ctx.rotate(Math.sin(now / 45) * 0.28);
+      ctx.strokeRect(-s * 0.35, -s * 0.7, s * 0.7, s * 1.4);
+      ctx.lineWidth = 8;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.6, -s * 0.3);
+        ctx.lineTo(side * s * 0.8, 0);
+        ctx.lineTo(side * s * 0.6, s * 0.3);
+        ctx.stroke();
+      }
+    } else {
+      const pulse = (now / 450) % 1;
+      ctx.beginPath();
+      ctx.arc(0, 0, s * 0.35, 0, LAP);
+      ctx.fill();
+      ctx.lineWidth = 8;
+      ctx.globalAlpha = 1 - pulse;
+      ctx.beginPath();
+      ctx.arc(0, 0, s * (0.5 + pulse * 0.5), 0, LAP);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  const simon = {
+    title: 'MOTION SAYS',
+    tagline: 'Do the move before the time bar runs out!',
+    controls: 'Watch the TV. Do the move it shows (shake, tap, turn, tilt) before time is up or you are out.',
+    button: 'TAP!',
+    stage: 'pause',   // pause -> cmd -> result -> pause ...
+    timer: 0,
+    roundNo: 0,
+    cmd: null,
+    lastCmd: null,
+    limit: 3.5,
+    justOut: [],
+    finished: false,
+
+    prepare(ps) {
+      this.stage = 'pause';
+      this.timer = 0;
+      this.roundNo = 0;
+      this.cmd = null;
+      this.lastCmd = null;
+      this.justOut = [];
+      this.finished = false;
+      ps.forEach((p) => {
+        p.simon = { alive: true, outRound: null, total: 0, done: false, shakeAcc: 0, tapped: false, baseWheel: 0, baseBeta: 0 };
+      });
+    },
+
+    startCommand() {
+      const choices = SIMON_COMMANDS.filter((c) => c !== this.lastCmd);
+      this.cmd = choices[Math.floor(Math.random() * choices.length)];
+      this.lastCmd = this.cmd;
+      this.limit = Math.max(1.8, 3.6 - this.roundNo * 0.2);
+      for (const p of active()) {
+        const s = p.simon;
+        s.done = false;
+        s.shakeAcc = 0;
+        s.tapped = false;
+        s.baseWheel = wheelOf(p);
+        s.baseBeta = p.input.beta;
+      }
+      this.stage = 'cmd';
+      this.timer = 0;
+      sendPhaseToAll();
+    },
+
+    check(p) {
+      const s = p.simon;
+      switch (this.cmd.id) {
+        case 'shake': return s.shakeAcc >= 250;
+        case 'tap': return s.tapped;
+        case 'left': return angleDiff(wheelOf(p), s.baseWheel) <= -35;
+        case 'right': return angleDiff(wheelOf(p), s.baseWheel) >= 35;
+        case 'up': return p.input.beta - s.baseBeta >= 30;
+        default: return p.input.beta - s.baseBeta <= -30;
+      }
+    },
+
+    endCommand() {
+      this.justOut = [];
+      for (const p of active()) {
+        if (p.simon.alive && !p.simon.done) {
+          p.simon.alive = false;
+          p.simon.outRound = this.roundNo;
+          this.justOut.push(p);
+        }
+      }
+      const total = active().length;
+      const left = active().filter((p) => p.simon.alive).length;
+      this.roundNo += 1;
+      this.finished = left <= (total > 1 ? 1 : 0) || this.roundNo >= SIMON_MAX_ROUNDS;
+      this.stage = 'result';
+      this.timer = 0;
+      sendPhaseToAll();
+    },
+
+    onShake(p, amount) {
+      if (this.stage === 'cmd' && p.simon && p.simon.alive) p.simon.shakeAcc += amount;
+    },
+
+    onButton(p, down) {
+      if (down && this.stage === 'cmd' && p.simon && p.simon.alive) p.simon.tapped = true;
+    },
+
+    update(now, dt) {
+      this.timer += dt;
+      if (this.stage === 'pause') {
+        if (this.timer >= SIMON_PAUSE) this.startCommand();
+      } else if (this.stage === 'cmd') {
+        const alive = active().filter((p) => p.simon.alive);
+        for (const p of alive) {
+          if (!p.simon.done && this.check(p)) {
+            p.simon.done = true;
+            p.simon.total += this.timer;
+            sendPhase(p);
+          }
+        }
+        if (alive.every((p) => p.simon.done) || this.timer >= this.limit) this.endCommand();
+      } else if (this.timer >= SIMON_RESULT) {
+        if (this.finished) return true;
+        this.stage = 'pause';
+        this.timer = 0;
+        sendPhaseToAll();
+      }
+      return false;
+    },
+
+    ranking() {
+      return active()
+        .sort((a, b) => {
+          if (a.simon.alive !== b.simon.alive) return a.simon.alive ? -1 : 1;
+          if (!a.simon.alive && a.simon.outRound !== b.simon.outRound) return b.simon.outRound - a.simon.outRound;
+          return a.simon.total - b.simon.total;
+        })
+        .map((p) => ({ p, label: p.simon.alive ? 'SURVIVED' : `out round ${p.simon.outRound + 1}` }));
+    },
+
+    phoneText(p) {
+      const s = p.simon;
+      if (!s.alive) return 'Too slow! You are out';
+      if (this.stage === 'cmd') return s.done ? 'Nice! Wait for the others...' : this.cmd.text;
+      if (this.stage === 'result') return s.done ? 'Safe!' : 'Get ready...';
+      return 'Get ready...';
+    },
+
+    draw(now, t) {
+      drawArcade(now);
+      shade(0.6);
+      bigText('MOTION SAYS', 50, 26, MAGENTA);
+      bigText(`ROUND ${Math.min(this.roundNo + (this.stage === 'result' ? 0 : 1), SIMON_MAX_ROUNDS)}`, 44, 14, CYAN, 'right', W - 24);
+
+      // The command screen, framed in chasing marquee bulbs
+      const bx = 140, by = 72, bw = 520, bh = 224;
+      panel(bx, by, bw, bh, '#2a2a3c', '#0b0720');
+      const phaseBulb = Math.floor(now / 300) % 2;
+      for (let i = 0; i <= bw / 24; i++) {
+        ctx.fillStyle = (i + phaseBulb) % 2 ? YELLOW : MAGENTA;
+        ctx.fillRect(bx + 4 + i * 24, by + 8, 8, 8);
+        ctx.fillRect(bx + 4 + i * 24, by + bh - 16, 8, 8);
+      }
+
+      if (this.stage === 'pause') {
+        bigText('GET READY...', 190, 36, '#e2e8f0');
+      } else if (this.stage === 'cmd') {
+        drawGlyph(this.cmd.id, CX, 160, 44, YELLOW, now);
+        bigText(this.cmd.text, 250, 34, YELLOW);
+        wrapText(this.cmd.hint, 274, 12, '#c8c8d8', 460);
+      } else {
+        const names = this.justOut.map((p) => `P${p.slot + 1}`).join(' & ');
+        bigText(this.justOut.length ? `${names} OUT!` : 'ALL SAFE!', 190, 34, this.justOut.length ? RED : GREEN);
+      }
+
+      // Time bar, in chunky segments
+      if (this.stage === 'cmd') {
+        const frac = clamp(1 - this.timer / this.limit, 0, 1);
+        const color = frac > 0.5 ? GREEN : frac > 0.25 ? YELLOW : RED;
+        panel(bx, 308, bw, 28, '#2a2a3c', '#0b0720');
+        const segs = 24, lit = Math.ceil(segs * frac);
+        for (let k = 0; k < lit; k++) {
+          ctx.fillStyle = color;
+          ctx.fillRect(bx + 8 + k * ((bw - 16) / segs), 316, (bw - 16) / segs - 3, 12);
+        }
+      }
+
+      // One panel per player
+      const ps = active();
+      ps.forEach((p, i) => {
+        const s = p.simon;
+        const tight = ps.length > 4;
+        const w = tight ? 120 : 170, gap = tight ? 8 : 12;
+        const total = ps.length * w + (ps.length - 1) * gap;
+        const x = CX - total / 2 + i * (w + gap), y = 360;
+        const color = s.alive ? COLORS[p.slot] : '#4a4a60';
+        panel(x, y, w, 92, color, s.done && s.alive ? 'rgba(11,61,46,0.95)' : 'rgba(11,7,32,0.92)');
+        drawPerson(x + (tight ? 24 : 36), y + 76, tight ? 3 : 4, color, s.alive ? 1 : 0.35);
+        const tx = x + (tight ? 50 : 70);
+        bigText(`P${p.slot + 1}`, y + 36, tight ? 18 : 22, color, 'left', tx);
+        let status = 'WAITING';
+        let sc = '#8a8aa0';
+        if (!s.alive) { status = 'OUT'; sc = RED; }
+        else if (s.done) { status = 'DONE!'; sc = GREEN; }
+        else if (this.stage === 'cmd') { status = 'GO GO!'; sc = YELLOW; }
+        bigText(status, y + 68, tight ? 9 : 11, sc, 'left', tx);
+      });
+    },
+  };
+
+  const GAMES = { race, tug, arena, simon, fruit, plane, potato };
+
+  // ---------------------------------------------------------------- screens
+
+  // ---- clickable layout (canvas coordinates)
+
+  const MENU_BTN = { x: 622, y: 436, w: 170, h: 54 };
+  const START_BTN = { x: 150, y: 384, w: 500, h: 50 };
+  const BACK_BTN = { x: 16, y: 16, w: 128, h: 40 };
+  const MENU_ITEMS = [
+    { id: 'race', color: RED },
+    { id: 'tug', color: CYAN },
+    { id: 'arena', color: GREEN },
+    { id: 'simon', color: MAGENTA },
+    { id: 'fruit', color: YELLOW },
+    { id: 'plane', color: '#c8c8d8' },
+    { id: 'potato', color: ORANGE },
+    { id: 'party', color: VIOLET },
+  ];
+  const menuRect = (i) => ({ x: 16 + (i % 4) * 196, y: 100 + Math.floor(i / 4) * 178, w: 184, h: 160 });
+  const pointIn = (pt, r) => pt.x >= r.x && pt.x <= r.x + r.w && pt.y >= r.y && pt.y <= r.y + r.h;
+
+  // What a click or hover at a point would do on the current screen
+  function hitTarget(pt) {
+    if (phase === 'lobby') {
+      if (pointIn(pt, MENU_BTN)) return { act: 'menu' };
+      if (pointIn(pt, START_BTN) && Object.keys(players).length > 0) return { act: 'start' };
+      return null;
+    }
+    if (phase === 'menu') {
+      if (pointIn(pt, BACK_BTN)) return { act: 'back' };
+      const i = MENU_ITEMS.findIndex((_, k) => pointIn(pt, menuRect(k)));
+      return i >= 0 ? { act: 'pick', id: MENU_ITEMS[i].id } : null;
+    }
+    if (phase === 'intro' || phase === 'roundEnd' || phase === 'final') return { act: 'advance' };
+    return null;
+  }
+
+  function runAction(a) {
+    if (!a) return;
+    if (a.act === 'menu') toMenu();
+    else if (a.act === 'start') startParty();
+    else if (a.act === 'back') toLobby();
+    else if (a.act === 'advance') advance();
+    else if (a.act === 'pick') {
+      if (a.id === 'party') startParty();
+      else startSingle(a.id);
+    }
+  }
+
+  function drawMenu(now) {
+    drawArcade(now);
+    shade(0.45);
+    titleText('GAME SELECT', 64, 34, now);
+
+    const backOver = pointIn(mouse, BACK_BTN);
+    panel(BACK_BTN.x, BACK_BTN.y, BACK_BTN.w, BACK_BTN.h, backOver ? '#fff' : CYAN);
+    bigText('< BACK', BACK_BTN.y + 27, 13, backOver ? '#fff' : CYAN, 'center', BACK_BTN.x + BACK_BTN.w / 2);
+
+    MENU_ITEMS.forEach((item, i) => {
+      const r = menuRect(i);
+      const over = pointIn(mouse, r);
+      const g = item.id === 'party' ? null : GAMES[item.id];
+      panel(r.x, r.y, r.w, r.h, over ? '#ffffff' : item.color, over ? 'rgba(43,26,99,0.96)' : 'rgba(11,7,32,0.92)');
+      drawIcon(item.id, r.x + r.w / 2, r.y + 16, 4);
+      const name = g ? g.title : 'PARTY MODE';
+      bigText(name, r.y + 86, fitSize(name, 15, r.w - 20), item.color, 'center', r.x + r.w / 2);
+      wrapText(g ? g.tagline : `${PARTY_ROUNDS} random games. Most points wins!`, r.y + 108, 9, '#c8c8d8', r.w - 20, r.x + r.w / 2);
+    });
+
+    const n = Object.keys(players).length;
+    bigText(n > 0 ? `${n} PLAYER${n > 1 ? 'S' : ''} IN. CLICK A GAME!` : 'NO PLAYERS YET. OPEN THE PHONE PAGE.',
+      466, 12, n > 0 ? GREEN : MAGENTA);
+    if (performance.now() < toast.until) bigText(toast.text, 490, 14, YELLOW);
+  }
+
+  function drawLobby(now) {
+    drawArcade(now);
+    titleText('DORM PARTY', 96, 54, now);
+    bigText(`${PARTY_ROUNDS} ROUNDS. MOST POINTS WINS!`, 140, 13, CYAN);
+
+    // Menu shortcut, top right
+    const over = pointIn(mouse, MENU_BTN);
+    panel(MENU_BTN.x, MENU_BTN.y, MENU_BTN.w, MENU_BTN.h, over ? '#fff' : MAGENTA, over ? 'rgba(74,42,138,0.95)' : 'rgba(11,7,32,0.9)');
+    bigText('GAME MENU', MENU_BTN.y + 24, 11, over ? '#fff' : MAGENTA, 'center', MENU_BTN.x + MENU_BTN.w / 2);
+    bigText('OR PRESS M', MENU_BTN.y + 44, 8, '#c8c8d8', 'center', MENU_BTN.x + MENU_BTN.w / 2);
+
+    for (let slot = 0; slot < MAX_PLAYERS; slot++) {
+      const p = Object.values(players).find((q) => q.slot === slot);
+      const x = 26 + slot * 126, y = 172, w = 118, h = 184;
+      const color = COLORS[slot];
+      panel(x, y, w, h, p ? color : '#4a4a60', p ? 'rgba(11,7,32,0.93)' : 'rgba(11,7,32,0.7)');
+      drawPerson(x + w / 2, y + 100, 5, color, p ? 1 : 0.25);
+      bigText(`P${slot + 1}`, y + 128, 20, p ? color : '#5c5c78', 'center', x + w / 2);
+      if (!p) bigText('EMPTY', y + 160, 10, '#5c5c78', 'center', x + w / 2);
+      else if (p.ready) bigText('READY!', y + 162, 14, GREEN, 'center', x + w / 2);
+      else bigText('JOINED', y + 160, 11, '#fff', 'center', x + w / 2);
+    }
+
+    const count = Object.keys(players).length;
+    wrapText('Open the phone page, enable the gyro, then tap READY', 380, 11, '#fff', 720);
+    const blink = Math.floor(now / 500) % 2 === 0;
+    if (count > 0) {
+      if (blink) bigText('PRESS ENTER TO START', 428, 22, GREEN);
+    } else if (blink) {
+      bigText('INSERT COIN', 428, 26, YELLOW);
+    }
+    bigText('1 TO 6 PLAYERS', 470, 10, '#c8c8d8');
+  }
+
+  function drawIntro(now) {
+    drawArcade(now);
+    shade(0.35);
+    bigText(`ROUND ${round + 1} OF ${order.length}`, 60, 18, CYAN);
+    titleText(game.title, 140, 50, now);
+    wrapText(game.tagline, 196, 14, '#fff', 700);
+
+    panel(100, 240, 600, 112, MAGENTA);
+    bigText('HOW TO PLAY', 268, 11, MAGENTA);
+    wrapText(game.controls, 296, 12, '#fff', 540);
+
+    bigText('PHONE BUTTON', 384, 10, '#c8c8d8');
+    panel(CX - 110, 396, 220, 52, GREEN);
+    bigText(game.button, 430, 20, GREEN);
+    bigText('PRESS ENTER TO SKIP', 480, 9, '#c8c8d8');
+  }
+
+  function drawScoreRows(rows, y0) {
+    if (rows[0] && rows[0].points !== undefined) bigText('PTS', y0 - 40, 10, '#c8c8d8', 'right', 620);
+    bigText('TOTAL', y0 - 40, 10, '#c8c8d8', 'right', 716);
+    rows.forEach((r, i) => {
+      const y = y0 + i * (rows.length > 4 ? 44 : 56);
+      const color = COLORS[r.p.slot];
+      panel(88, y - 32, 640, rows.length > 4 ? 38 : 48, color, 'rgba(11,7,32,0.93)');
+      bigText(`${ordinal(i + 1)}`, y, 18, '#fff', 'left', 108);
+      bigText(`P${r.p.slot + 1}`, y, 20, color, 'left', 196);
+      if (r.label) bigText(r.label, y, 12, '#c8c8d8', 'right', 530);
+      if (r.points !== undefined) bigText(`+${r.points}`, y, 18, GREEN, 'right', 620);
+      bigText(`${r.p.score}`, y, 20, YELLOW, 'right', 708);
+    });
+  }
+
+  function drawRoundEnd(now) {
+    drawArcade(now);
+    shade(0.5);
+    titleText(`${game.title}`, 70, 30, now);
+    bigText('RESULTS', 108, 14, CYAN);
+    drawScoreRows(roundResults, roundResults.length > 4 ? 178 : 190);
+    const last = round + 1 >= order.length;
+    if (Math.floor(now / 500) % 2 === 0) {
+      const text = !last ? 'ENTER FOR NEXT GAME' : single ? 'ENTER FOR THE MENU' : 'ENTER FOR FINAL SCORES';
+      bigText(text, 474, 16, GREEN);
+    }
+  }
+
+  function drawFinal(now) {
+    drawArcade(now);
+    shade(0.45);
+    const rows = active().sort((a, b) => b.score - a.score).map((p) => ({ p, label: '' }));
+    const top = rows[0].p.score;
+    const winners = rows.filter((r) => r.p.score === top);
+    const winText = winners.length > 1
+      ? `TIE: ${winners.map((w) => 'P' + (w.p.slot + 1)).join(' & ')}!`
+      : `PLAYER ${winners[0].p.slot + 1} WINS!`;
+    titleText(winText, 84, 38, now);
+    bigText('FINAL SCORES', 124, 13, CYAN);
+    drawScoreRows(rows, rows.length > 4 ? 206 : 214);
+    if (Math.floor(now / 500) % 2 === 0) bigText('PRESS ENTER TO PLAY AGAIN', 474, 16, GREEN);
+  }
+
+  function render(now) {
+    tctx.clearRect(0, 0, W, H);
+
+    if (phase === 'lobby') drawLobby(now);
+    else if (phase === 'menu') drawMenu(now);
+    else if (phase === 'intro') drawIntro(now);
+    else if (phase === 'final') drawFinal(now);
+    else if (phase === 'roundEnd') drawRoundEnd(now);
+    else {
+      const t = Math.max(0, (now - playStart) / 1000);
+      game.draw(now, t);
+      bigText(single ? 'SINGLE GAME  (ESC = EXIT)' : `ROUND ${round + 1}/${order.length}`, H - 10, 9, '#c8c8d8', 'left', 12);
+
+      if (phase === 'countdown') {
+        shade(0.35);
+        const left = COUNTDOWN_SECONDS - Math.floor((now - phaseStart) / 1000);
+        bigText(String(Math.max(1, left)), 310, 150, YELLOW);
+      } else if (t < 1) {
+        bigText('GO!', 310, 150, GREEN);
+      }
+    }
+  }
+
+  let lastFrame = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    update(now, dt);
+    render(now);
+    present();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') advance();
+    else if ((e.key === 'm' || e.key === 'M') && phase === 'lobby') toMenu();
+    else if (e.key === 'Escape' && phase !== 'lobby') toLobby();
+    else if (phase === 'menu' && e.key >= '1' && e.key <= String(MENU_ITEMS.length)) {
+      runAction({ act: 'pick', id: MENU_ITEMS[Number(e.key) - 1].id });
+    }
+  });
+
+  const canvasPoint = (e) => {
+    const r = display.getBoundingClientRect();
+    return { x: ((e.clientX - r.left) * W) / r.width, y: ((e.clientY - r.top) * H) / r.height };
+  };
+  display.addEventListener('mousemove', (e) => {
+    mouse = canvasPoint(e);
+    display.style.cursor = hitTarget(mouse) ? 'pointer' : 'default';
+  });
+  display.addEventListener('mouseleave', () => { mouse = { x: -1, y: -1 }; });
+  display.addEventListener('click', (e) => runAction(hitTarget(canvasPoint(e))));
+
+  // ------------------------------------------------------- phone messages
+
+  function handleMessage(p, e) {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'gyro') {
+      // Raw tilt, used by games that read the phone's angle
+      p.input.beta = msg.x;
+      p.input.gamma = msg.y;
+      p.input.wheel = msg.wheel;
+      // Steering-wheel angle if the phone sent one, otherwise sideways tilt
+      const angle = msg.wheel === null || msg.wheel === undefined ? msg.y : msg.wheel;
+      p.input.steer = Math.abs(angle) < 4 ? 0 : clamp(angle / 40, -1, 1);
+    }
+
+    if (msg.type === 'flick' && phase === 'play' && p.active && game.onFlick) {
+      game.onFlick(p, msg.peak);
+    }
+
+    if (msg.type === 'shake' && phase === 'play' && p.active && game.onShake) {
+      game.onShake(p, msg.amount);
+    }
+
+    if (msg.type === 'button') {
+      const down = msg.state === 'down';
+      p.input.gas = down;
+      // In the lobby, the button is the ready button
+      if (down && phase === 'lobby') {
+        p.ready = !p.ready;
+        sendPhase(p);
+      }
+      if (phase === 'play' && p.active && game.onButton) game.onButton(p, down);
+    }
+  }
+
+  // ----------------------------------------------------------- signaling
+
+  // Create a fresh peer connection for one phone. The TV creates the data
+  // channel before making the offer so it is included in the SDP.
+  function createPeer(phoneId, p) {
+    if (p.pc) p.pc.close();
+    lastConnId += 1;
+    const id = lastConnId;
+    p.connId = id;
+    p.remoteSet = false;
+    p.pendingCandidates = [];
+
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    p.pc = pc;
+    const label = `player ${p.slot + 1}`;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        ws.send(JSON.stringify({ type: 'candidate', to: phoneId, connId: id, candidate: e.candidate }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`${label} connectionState: ${pc.connectionState}`);
+      if (players[phoneId] !== p) return;
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') removePlayer(phoneId);
+      else updateDebug(`${label}: ${pc.connectionState}`);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`${label} iceConnectionState: ${pc.iceConnectionState}`);
+    };
+
+    const channel = pc.createDataChannel('game-inputs');
+    p.channel = channel;
+    channel.onopen = () => {
+      sendTo(p, { type: 'assign', slot: p.slot, color: COLORS[p.slot] });
+      sendPhase(p);
+      updateDebug(`${label} connected`);
+    };
+    channel.onclose = () => {
+      if (players[phoneId] === p && p.pc === pc) removePlayer(phoneId);
+    };
+    channel.onmessage = (e) => handleMessage(p, e);
+  }
+
+  async function sendOffer(phoneId, p) {
+    createPeer(phoneId, p);
+    const id = p.connId;
+    const pc = p.pc;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({ type: 'offer', to: phoneId, connId: id, sdp: pc.localDescription }));
+  }
+
+  ws.onmessage = async (msg) => {
+    const data = JSON.parse(msg.data);
+    const phoneId = data.phoneId;
+    if (!phoneId) return;
+
+    if (data.type === 'ready') {
+      // A phone repeats "ready" until it gets an offer. Ignore those repeats
+      // while its connection is still being set up or is live.
+      const existing = players[phoneId];
+      if (existing && existing.pc.connectionState !== 'failed' && existing.pc.connectionState !== 'closed') return;
+      if (existing) removePlayer(phoneId);
+
+      const slot = freeSlot();
+      if (slot === -1) {
+        ws.send(JSON.stringify({ type: 'full', to: phoneId }));
+        return;
+      }
+
+      const p = {
+        slot, pc: null, channel: null, connId: 0, remoteSet: false, pendingCandidates: [],
+        input: { steer: 0, gas: false, beta: 0, gamma: 0, wheel: null },
+        ready: false, active: false, score: 0,
+      };
+      players[phoneId] = p;
+      updateDebug(`player ${slot + 1} connecting...`);
+      await sendOffer(phoneId, p);
+      return;
+    }
+
+    const p = players[phoneId];
+    if (!p || data.connId !== p.connId) return;
+
+    if (data.type === 'answer') {
+      if (p.pc.signalingState !== 'have-local-offer') return;
+      await p.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      p.remoteSet = true;
+      for (const c of p.pendingCandidates) await p.pc.addIceCandidate(c);
+      p.pendingCandidates = [];
+    } else if (data.type === 'candidate') {
+      const cand = new RTCIceCandidate(data.candidate);
+      if (p.remoteSet) await p.pc.addIceCandidate(cand);
+      else p.pendingCandidates.push(cand);
+    }
+  };
+</script>
+</body>
+</html>

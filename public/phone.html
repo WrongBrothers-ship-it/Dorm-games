@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Controller</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0; padding: 16px; min-height: 100vh; color: #fff; text-align: center;
+      font-family: 'Press Start 2P', 'Courier New', monospace; font-size: 11px; line-height: 1.5;
+      background:
+        linear-gradient(180deg, #0b0720 0%, #2b1a63 55%, #4a2a8a 100%);
+      user-select: none; -webkit-user-select: none; touch-action: manipulation;
+      image-rendering: pixelated;
+    }
+    /* A checkered neon floor along the bottom, like the arcade hall */
+    body::before {
+      content: ''; position: fixed; left: 0; right: 0; bottom: 0; height: 32vh; z-index: -1; pointer-events: none;
+      background:
+        repeating-conic-gradient(#6b3fc0 0% 25%, #c0289c 0% 50%) 0 0 / 48px 48px;
+      opacity: 0.55;
+      -webkit-mask-image: linear-gradient(to top, #000, transparent);
+              mask-image: linear-gradient(to top, #000, transparent);
+    }
+    #status {
+      padding: 12px 8px; margin-bottom: 14px; background: #0b0720;
+      border: 4px solid #27d3ff; box-shadow: 4px 4px 0 #000;
+    }
+    #phase {
+      margin-bottom: 14px; min-height: 64px; color: #ffe83a; font-size: 13px; text-shadow: 3px 3px 0 #4a2a8a;
+    }
+    #gyro-info { font-size: 9px; color: #c8c8d8; }
+    #gyro-state { margin: 10px 0; padding: 10px 8px; font-size: 10px; background: #5c5c78; border: 4px solid #000; }
+    button { font-family: inherit; border: 0; color: #fff; }
+    #gyro-perm-btn {
+      font-size: 11px; padding: 14px 16px; margin: 6px 0 22px; background: #0b0720; color: #ff3fb4;
+      border: 4px solid #ff3fb4; box-shadow: 4px 4px 0 #000;
+    }
+    #gyro-perm-btn:active { transform: translate(4px, 4px); box-shadow: none; }
+    /* A big arcade button in your player colour */
+    #action-btn {
+      width: 200px; height: 200px; border-radius: 50%; font-size: 18px; color: #0b0720;
+      background: radial-gradient(circle at 34% 28%, rgba(255,255,255,0.8) 0 12%, transparent 13%), var(--player, #27d3ff);
+      border: 8px solid #000;
+      box-shadow: 0 12px 0 #000, inset -14px -14px 0 rgba(0,0,0,0.28);
+      transition: transform 0.05s, box-shadow 0.05s;
+    }
+    #action-btn:active { transform: translateY(10px); box-shadow: 0 2px 0 #000, inset -14px -14px 0 rgba(0,0,0,0.28); }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+  <div id="phase"></div>
+  <div id="gyro-info">Tilt: -</div>
+  <div id="gyro-state">Gyro: off</div>
+  <button id="gyro-perm-btn">Enable Gyro</button>
+  <div><button id="action-btn">READY</button></div>
+<script>
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}`);
+
+  const statusEl = document.getElementById('status');
+  const gyroInfoEl = document.getElementById('gyro-info');
+
+  // Identifies this phone to the TV. The server relays everything to everyone,
+  // so each side addresses messages and ignores ones meant for other phones.
+  const phoneId = Math.random().toString(36).slice(2, 10);
+
+  let pc = null;
+  let dataChannel = null;
+  // Id of the offer this phone is answering. Candidates from any other id are dropped.
+  let connId = null;
+  let remoteSet = false;
+  let pendingCandidates = [];
+
+  function createPeer(id) {
+    if (pc) pc.close();
+    connId = id;
+    remoteSet = false;
+    pendingCandidates = [];
+
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        ws.send(JSON.stringify({ type: 'candidate', phoneId, connId: id, candidate: e.candidate }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`connectionState: ${pc.connectionState}`);
+      // "connected" is shown by the data channel handlers, which know the player number
+      if (pc.connectionState !== 'connected') statusEl.textContent = `Status: ${pc.connectionState}`;
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`iceConnectionState: ${pc.iceConnectionState}`);
+    };
+
+    // The TV creates the channel, so the phone receives it here
+    pc.ondatachannel = (e) => {
+      dataChannel = e.channel;
+      dataChannel.onopen = () => {
+        statusEl.textContent = 'Status: Connected to TV!';
+        statusEl.style.background = '#1f7a3a';
+      };
+      // The TV tells us which player we are
+      dataChannel.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'assign') {
+          statusEl.textContent = `Status: Connected as Player ${msg.slot + 1}`;
+          document.getElementById('action-btn').style.setProperty('--player', msg.color);
+        } else if (msg.type === 'phase') {
+          document.getElementById('phase').textContent = msg.text;
+          document.getElementById('action-btn').textContent = msg.button;
+          if (navigator.vibrate && msg.phase === 'play') navigator.vibrate(200);
+        }
+      };
+      dataChannel.onclose = () => {
+        statusEl.textContent = 'Status: Disconnected';
+        statusEl.style.background = '#d93a1a';
+      };
+    };
+  }
+
+  // Tell the TV we're here so it sends an offer
+  let readyTimer = null;
+
+  function sendReady() {
+    ws.send(JSON.stringify({ type: 'ready', phoneId }));
+  }
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Waiting for TV...';
+    sendReady();
+    // Keep announcing until the TV sends an offer, in case the TV page opens later
+    readyTimer = setInterval(sendReady, 1000);
+  };
+
+  ws.onmessage = async (msg) => {
+    const data = JSON.parse(msg.data);
+    if (data.to !== phoneId) return;
+
+    if (data.type === 'full') {
+      statusEl.textContent = 'Status: TV is full (6/6), waiting for a free spot...';
+    } else if (data.type === 'offer') {
+      clearInterval(readyTimer);
+      createPeer(data.connId);
+      const peer = pc;
+      await peer.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      remoteSet = true;
+      for (const c of pendingCandidates) await peer.addIceCandidate(c);
+      pendingCandidates = [];
+
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: 'answer', phoneId, connId: data.connId, sdp: peer.localDescription }));
+    } else if (data.type === 'candidate') {
+      if (data.connId !== connId) return;
+      const cand = new RTCIceCandidate(data.candidate);
+      if (remoteSet) await pc.addIceCandidate(cand);
+      else pendingCandidates.push(cand);
+    }
+  };
+
+  const sendInput = (type, payload) => {
+    if (dataChannel && dataChannel.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type, ...payload }));
+    }
+  };
+
+  const actionBtn = document.getElementById('action-btn');
+  actionBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    sendInput('button', { name: 'ACTION', state: 'down' });
+  });
+  actionBtn.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    sendInput('button', { name: 'ACTION', state: 'up' });
+  });
+
+  const gyroStateEl = document.getElementById('gyro-state');
+  const setGyroState = (text, color) => {
+    gyroStateEl.textContent = `Gyro: ${text}`;
+    gyroStateEl.style.background = color;
+  };
+
+  // Steering-wheel angle in degrees (right = positive), from gravity on the screen plane.
+  // iOS reports gravity with the opposite sign to Android, so normalize it.
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  let wheel = null;
+  let flickPeak = 0;
+  let flickLive = false;
+  let lastFlick = 0;
+  let shakeAmount = 0;
+  let lastShakeSend = 0;
+  const handleMotion = (event) => {
+    const g = event.accelerationIncludingGravity;
+    if (!g || g.x === null || g.y === null) return;
+    const sign = isIOS ? -1 : 1;
+    wheel = Math.round(Math.atan2(-g.x * sign, g.y * sign) * 180 / Math.PI);
+
+    // Shake strength: how far total acceleration strays from plain gravity.
+    // Tilting alone keeps the total near 9.8, so only real movement counts.
+    if (g.z !== null) {
+      const total = Math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+      shakeAmount += Math.max(0, Math.abs(total - 9.81) - 2.5);
+    }
+    // Flick: a sharp spike of acceleration that settles again. Its peak sets the throw strength.
+    const lin = event.acceleration && event.acceleration.x !== null
+      ? Math.hypot(event.acceleration.x, event.acceleration.y, event.acceleration.z || 0)
+      : (g.z !== null ? Math.abs(Math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z) - 9.81) : 0);
+    if (lin > flickPeak) flickPeak = lin;
+    if (lin > 14) flickLive = true;
+    if (flickLive && lin < 5) {
+      if (Date.now() - lastFlick > 500) {
+        sendInput('flick', { peak: Math.round(flickPeak) });
+        lastFlick = Date.now();
+      }
+      flickLive = false;
+      flickPeak = 0;
+    } else if (!flickLive && lin < 5) {
+      flickPeak = 0;
+    }
+
+    const now = Date.now();
+    if (now - lastShakeSend > 50) {
+      if (shakeAmount > 0) sendInput('shake', { amount: Math.round(shakeAmount) });
+      shakeAmount = 0;
+      lastShakeSend = now;
+    }
+  };
+
+  let lastSend = 0;
+  const handleOrientation = (event) => {
+    if (event.beta === null && event.gamma === null) return;
+    setGyroState('active', '#1f7a3a');
+    const now = Date.now();
+    if (now - lastSend > 40) {
+      const x = Math.round(event.beta || 0);
+      const y = Math.round(event.gamma || 0);
+      gyroInfoEl.textContent = `Tilt: X: ${x} | Y: ${y} | Wheel: ${wheel === null ? 'n/a' : wheel}`;
+      sendInput('gyro', { x, y, wheel });
+      lastSend = now;
+    }
+  };
+
+  document.getElementById('gyro-perm-btn').addEventListener('click', async () => {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const response = await DeviceOrientationEvent.requestPermission();
+        if (typeof DeviceMotionEvent !== 'undefined' &&
+            typeof DeviceMotionEvent.requestPermission === 'function') {
+          await DeviceMotionEvent.requestPermission();
+        }
+        if (response === 'granted') {
+          startGyro();
+        } else {
+          setGyroState('permission denied', '#d93a1a');
+        }
+      } catch (e) {
+        console.error(e);
+        setGyroState(`error: ${e.message}`, '#d93a1a');
+      }
+    } else {
+      startGyro();
+    }
+  });
+
+  // Enabled doesn't mean working: if no sensor data arrives, say so
+  function startGyro() {
+    window.addEventListener('deviceorientation', handleOrientation);
+    window.addEventListener('devicemotion', handleMotion);
+    setGyroState('enabled, waiting for data...', '#b06a2a');
+    setTimeout(() => {
+      if (gyroStateEl.textContent !== 'Gyro: active') {
+        setGyroState('no sensor data (see HTTPS / settings)', '#d93a1a');
+      }
+    }, 2000);
+  }
+</script>
+</body>
+</html>
